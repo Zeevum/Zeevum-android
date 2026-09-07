@@ -1,0 +1,363 @@
+import { VerticalBox, HorizontalBox, LineEdit, Button, ListView, ScrollView } from "std-widgets.slint";
+
+struct FriendEntry {
+    login: string,
+    chat-id: int,
+    unread: int,
+}
+
+struct MessageEntry {
+    text: string,
+    is-outgoing: bool, // true - мое (справа), false - входящее (слева)
+    status: int,       // 0=отправлено, 1=доставлено(1 галочка), 2=прочитано(2 галочки)
+}
+
+struct LogEntry {
+    text: string,
+    color: int,
+}
+
+component FriendItem inherits Rectangle {
+    in property <FriendEntry> entry;
+    callback clicked;
+
+    height: 50px;
+    background: ta.has-hover ? #2a2a3a : #1e1e2e;
+
+    HorizontalBox {
+        padding: 10px;
+        spacing: 10px;
+        Text {
+            text: entry.login;
+            font-size: 16px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        if entry.unread > 0 : Rectangle {
+            width: 10px;
+            height: 10px;
+            background: #ff5555;
+            border-radius: 5px;
+        }
+    }
+
+    // ИСПРАВЛЕНО: добавлено имя ta для TouchArea
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component MessageBubble inherits Rectangle {
+    in property <MessageEntry> entry;
+    out property <length> natural-width: measure.preferred-width + 20px; // + паддинги
+
+    background: entry.is-outgoing ? #004e64 : #262633;
+    border-radius: 8px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+
+    // Скрытая копия без переноса: её preferred-width = полная ширина строки
+    measure := Text {
+        visible: false;
+        text: entry.text;
+        wrap: TextWrap.no-wrap;
+    }
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 4px;
+
+        Text {
+            text: entry.text;
+            color: white;
+            wrap: TextWrap.word-wrap;
+            horizontal-alignment: entry.is-outgoing ? TextHorizontalAlignment.right
+                                                    : TextHorizontalAlignment.left;
+        }
+
+        if entry.is-outgoing : Text {
+            text: entry.status == 0 ? "⌛" : entry.status == 1 ? "✓" : "✓✓";
+            color: entry.status == 2 ? #5599ff : #888888;
+            font-size: 12px;
+            horizontal-alignment: TextHorizontalAlignment.right;
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Rusty Chat";
+    preferred-width: 800px;
+    preferred-height: 600px;
+
+    in-out property <int> current-screen: 0; // 0:Auth, 1:Chat, 2:Settings, 3:Search
+    in-out property <string> server-address: "my.domain.com:6969";
+    in-out property <string> login-text: "";
+    in-out property <string> password-text: "";
+    in-out property <string> confirm-password-text: "";
+    in-out property <string> status-message: "";
+    in-out property <[LogEntry]> log: [];
+    in-out property <[FriendEntry]> friends-list: [];
+    in-out property <[MessageEntry]> active-chat-messages: [];
+    in-out property <int> active-chat-id: -1;
+    in-out property <string> active-chat-login: "";
+    in-out property <string> input-text: "";
+    in-out property <string> search-text: "";
+    in-out property <string> search-result: "";
+    in-out property <bool> scroll-pending: false;
+
+    property <float> pw-bar-width:
+        root.password-strength == 4 ? 1.0 :
+        root.password-strength == 3 ? 0.80 :
+        root.password-strength == 2 ? 0.55 :
+        root.password-strength == 1 ? 0.30 :
+        (root.password-text != "" ? 0.15 : 0.0);
+
+    property <color> pw-bar-color:
+        root.password-strength <= 1 ? #ff5555 :
+        root.password-strength == 2 ? #ffaa00 :
+        root.password-strength == 3 ? #aaff00 : #00ff00;
+
+    property <bool> passwords-mismatch:
+        root.confirm-password-text != "" && root.password-text != root.confirm-password-text;
+
+    in-out property <int> password-strength: 0;
+    in-out property <string> password-strength-text: "";
+
+    // --- ЭКРАН АВТОРИЗАЦИИ (0) ---
+    VerticalBox {
+        padding: 20px;
+        spacing: 15px;
+        visible: root.current-screen == 0;
+
+        HorizontalBox {
+            Text {
+                text: "Rusty Chat";
+                font-size: 28px;
+                font-weight: 700;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Button {
+                text: "⚙";
+                width: 40px;
+                clicked => { root.current-screen = 2; }
+            }
+        }
+
+        Text {
+            text: status-message;
+            color: #ff5555;
+            wrap: TextWrap.word-wrap;
+        }
+
+        HorizontalBox {
+            spacing: 10px;
+            Text { text: "Login:"; vertical-alignment: center; min-width: 80px; }
+            LineEdit { placeholder-text: "Enter login"; text <=> login-text; horizontal-stretch: 1; }
+        }
+
+        HorizontalBox {
+            spacing: 10px;
+            Text { text: "Password:"; vertical-alignment: center; min-width: 80px; }
+            LineEdit { input-type: InputType.password; placeholder-text: "Enter password"; text <=> password-text; horizontal-stretch: 1; }
+        }
+
+        HorizontalBox {
+            spacing: 10px;
+            Button {
+                text: "Register";
+                horizontal-stretch: 1;
+                clicked => { root.current-screen = 4; } // Экран регистрации
+            }
+            Button {
+                text: "Login";
+                horizontal-stretch: 1;
+                clicked => { root.connect(server-address, login-text, password-text, false); }
+            }
+        }
+    }
+
+    // --- ЭКРАН РЕГИСТРАЦИИ (4) ---
+    VerticalBox {
+        padding: 20px;
+        spacing: 15px;
+        visible: root.current-screen == 4;
+
+        Text {
+            text: "Register";
+            font-size: 24px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+
+        LineEdit { placeholder-text: "Login (3-32 chars, a-z, 0-9, _)"; text <=> login-text; }
+        LineEdit { input-type: InputType.password; placeholder-text: "Password"; text <=> password-text; edited => { root.check-password-strength(password-text); } }
+
+        Rectangle {
+            height: 6px; background: #2d2d2d; border-radius: 3px; clip: true;
+            Rectangle {
+                height: 100%; border-radius: 3px;
+                width: parent.width * root.pw-bar-width; background: root.pw-bar-color;
+                animate width { duration: 250ms; easing: ease-in-out; }
+                animate background { duration: 250ms; easing: ease-in-out; }
+            }
+        }
+
+        Text { text: root.password-text != "" ? root.password-strength-text : ""; font-size: 12px; color: #d7d7d7; }
+        LineEdit { input-type: InputType.password; placeholder-text: "Confirm Password"; text <=> confirm-password-text; }
+        Text { text: root.passwords-mismatch ? "Passwords do not match" : ""; color: #ff5555; font-size: 12px; }
+        Text { text: status-message; color: #ff5555; wrap: TextWrap.word-wrap; }
+
+        HorizontalBox {
+            spacing: 10px;
+            Button { text: "Back"; horizontal-stretch: 1; clicked => { root.current-screen = 0; } }
+            Button {
+                text: "Register";
+                horizontal-stretch: 1;
+                enabled: root.password-text != "" && root.password-text == root.confirm-password-text && root.password-strength >= 2;
+                clicked => { root.connect(server-address, login-text, password-text, true); }
+            }
+        }
+    }
+
+    // --- ЭКРАН НАСТРОЕК (2) ---
+    VerticalBox {
+        padding: 20px;
+        spacing: 15px;
+        visible: root.current-screen == 2;
+
+        Text { text: "Server Settings"; font-size: 24px; font-weight: 700; horizontal-alignment: center; }
+        HorizontalBox {
+            spacing: 10px;
+            Text { text: "Address:"; vertical-alignment: center; min-width: 80px; }
+            LineEdit { placeholder-text: "my.domain.com:6969"; text <=> server-address; horizontal-stretch: 1; }
+        }
+        HorizontalBox {
+            spacing: 10px;
+            Button { text: "Back"; horizontal-stretch: 1; clicked => { root.current-screen = 0; } }
+            Button { text: "Save"; horizontal-stretch: 1; clicked => { root.save-settings(server-address); root.current-screen = 0; } }
+        }
+    }
+
+    // --- ЭКРАН ПОИСКА (3) ---
+    VerticalBox {
+        padding: 20px;
+        spacing: 15px;
+        visible: root.current-screen == 3;
+
+        Text { text: "Add Friend"; font-size: 24px; font-weight: 700; horizontal-alignment: center; }
+        LineEdit { placeholder-text: "Enter user login..."; text <=> search-text; }
+        Button { text: "Search"; clicked => { root.search-user(search-text); } }
+
+        Text { text: search-result; color: #ff5555; wrap: TextWrap.word-wrap; }
+
+        Button { text: "Back"; clicked => { root.current-screen = 1; } }
+    }
+
+    // --- ГЛАВНЫЙ ЭКРАН ЧАТА (1) ---
+    HorizontalBox {
+        padding: 0px;
+        spacing: 0px;
+        visible: root.current-screen == 1;
+
+        // ЛЕВАЯ ПАНЕЛЬ (Список друзей)
+        Rectangle {
+            width: 250px;
+            background: #1a1a24;
+
+            VerticalBox {
+                padding: 10px;
+                spacing: 10px;
+
+                Text { text: "Chats"; font-size: 20px; font-weight: 700; }
+
+                ListView {
+                    vertical-stretch: 1;
+                    for entry in root.friends-list : FriendItem {
+                        entry: entry;
+                        clicked => { root.open-chat(entry.chat-id, entry.login); }
+                    }
+                }
+
+                Button { text: "🔍 Search User"; clicked => { root.current-screen = 3; } }
+                Button { text: "Disconnect"; clicked => { root.disconnect(); } }
+            }
+        }
+
+        // ПРАВАЯ ПАНЕЛЬ (Окно чата)
+        Rectangle {
+            horizontal-stretch: 1;
+            background: #111118;
+
+            VerticalBox {
+                padding: 10px;
+                spacing: 10px;
+
+                if root.active-chat-id == -1 : Text {
+                    text: "Select a chat to start messaging";
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    vertical-stretch: 1;
+                }
+
+                if root.active-chat-id != -1 : VerticalBox {
+                    vertical-stretch: 1;
+                    spacing: 10px;
+
+                    Text { text: root.active-chat-login; font-size: 18px; font-weight: 700; }
+
+                    ScrollView {
+                        vertical-stretch: 1;
+                        chat-list := ListView {
+                            changed viewport-height => {
+                                if (root.scroll-pending && self.viewport-height > 0) {
+                                    self.viewport-y = self.height - self.viewport-height;
+                                }
+                            }
+                            for msg in root.active-chat-messages : HorizontalBox {
+                                spacing: 0px;
+                                padding: 5px;
+
+                                if msg.is-outgoing : Rectangle {
+                                    horizontal-stretch: 1;
+                                    min-width: 0px;
+                                }
+
+                                bubble := MessageBubble {
+                                    entry: msg;
+                                    width: min(bubble.natural-width, chat-list.width * 70%);
+                                }
+
+                                if !msg.is-outgoing : Rectangle {
+                                    horizontal-stretch: 1;
+                                    min-width: 0px;
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalBox {
+                        spacing: 10px;
+                        LineEdit {
+                            placeholder-text: "Type message...";
+                            text <=> input-text;
+                            horizontal-stretch: 1;
+                            accepted => {
+                                if input-text != "" { root.send-msg(input-text); input-text = ""; }
+                            }
+                        }
+                        Button { text: "Send"; clicked => { if input-text != "" { root.send-msg(input-text); input-text = ""; } } }
+                    }
+                }
+            }
+        }
+    }
+
+    callback connect(string, string, string, bool);
+    callback disconnect();
+    callback save-settings(string);
+    callback check-password-strength(string);
+    callback search-user(string);
+    callback open-chat(int, string);
+    callback send-msg(string);
+}

@@ -1,0 +1,29 @@
+[package]
+name = "MUC-android"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+Zeevum-protocol = { git = "https://github.com/Zeevum/Zeevum-protocol", tag = "v0.1.0" }
+slint = { version = "1.17.1", features = ["compat-1-2", "backend-winit", "renderer-winit-software"] }
+tokio = { version = "1.53.1", features = ["rt", "net", "io-util", "macros", "time", "sync", "rt-multi-thread"] }
+anyhow = "1.0.104"
+chrono = "0.4.45"
+dirs = "7.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio-rustls = "0.26.4"
+rustls = "0.23.43"
+rustls-native-certs = "0.8.4"
+rustls-pki-types = "1.15.1"
+uuid = { version = "1.23.2", features = ["v4"] }
+zxcvbn = "3.1.1"
+
+[build-dependencies]
+slint-build = "1.17.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
