@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Rusty Chat Android Client
 
 Исправленная версия с рабочими методами доступа к свойствам Slint.
@@ -11,3 +12,7 @@
 ```bash
 cargo apk build --release
 cargo apk run
+=======
+# Zeevum-android
+Android client for connecting to Zeevum servers
+>>>>>>> 618e57773ad1b346bda804a874019d394ae0c021
