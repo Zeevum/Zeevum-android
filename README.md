@@ -31,7 +31,7 @@ Android — целевая платформа, в разработке
 ```bash
 git clone https://github.com/Zeevum/Zeevum-android.git
 cd Zeevum-android
-cargo run
+cargo run --release
 ```
 UI описан в `ui/app.slint`, логика — в `src/`:
 1. network.rs — соединение, TLS, рукопожатие, разбор протокола
