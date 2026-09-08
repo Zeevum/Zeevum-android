@@ -21,11 +21,15 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
+      - name: List build artifacts
+        shell: pwsh
+        run: Get-ChildItem -Recurse target\release -Include *.exe | Select-Object FullName
+
       - name: Prepare artifact
         shell: pwsh
         run: |
           mkdir staging
-          copy target\release\Zeevum-android.exe staging\
+          copy target\release\<РЕАЛЬНОЕ_ИМЯ>.exe staging\
           Compress-Archive -Path staging\* -DestinationPath zeevum-client-windows-x64.zip
 
       - name: Upload to Release
