@@ -3,7 +3,7 @@ name: Build and Release (Client)
 on:
   push:
     tags:
-      - 'client-v*'
+      - 'v*'
 
 permissions:
   contents: write
