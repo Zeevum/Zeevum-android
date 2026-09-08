@@ -216,7 +216,6 @@ impl AppController {
             }
 
             if let Some(idx) = state_lock.friends.iter().position(|(id, _)| *id == chat_id_i64) {
-                let chat_id_i32 = chat_id_i64 as i32;
                 slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_weak.upgrade() {
                         let model = ui.get_friends_list();
