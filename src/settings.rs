@@ -12,11 +12,11 @@ pub struct AppSettings {
 
 fn get_settings_path() -> PathBuf {
     let mut path = dirs::config_dir().unwrap_or_else(|| std::env::current_dir().expect("no config dir and no cwd"));
-    let profile = std::env::var("MUC_PROFILE").unwrap_or_default();
+    let profile = std::env::var("ZEEVUM_PROFILE").unwrap_or_default();
     let filename = if profile.trim().is_empty() {
-        "muc_client_settings.json".to_string()
+        "zeevum_client_settings.json".to_string()
     } else {
-        format!("muc_client_settings_{}.json", profile)
+        format!("zeevum_client_settings_{}.json", profile)
     };
     path.push(filename);
     path

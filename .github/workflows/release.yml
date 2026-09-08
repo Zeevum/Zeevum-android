@@ -29,7 +29,7 @@ jobs:
         shell: pwsh
         run: |
           mkdir staging
-          copy target\release\<РЕАЛЬНОЕ_ИМЯ>.exe staging\
+          copy target\release\Zeevum-android.exe staging\
           Compress-Archive -Path staging\* -DestinationPath zeevum-client-windows-x64.zip
 
       - name: Upload to Release
