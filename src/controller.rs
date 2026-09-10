@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::network::network_task;
 use crate::settings;
-use crate::types::{CmdSender, UiEvent};
+use crate::types::{ChatMessage, CmdSender, DeliveryStatus, UiEvent};
 use crate::{FriendEntry, MainWindow, MessageEntry};
 
 use Zeevum_protocol::{ClientMsg, ServerMsg};
@@ -24,7 +24,7 @@ pub struct ChatState {
     pub server_addr: String,
     pub login: String,
     pub friends: Vec<(i64, String)>,
-    pub messages: HashMap<i64, Vec<(String, i64, String, bool, i32)>>,
+    pub messages: HashMap<i64, Vec<ChatMessage>>,
     pub incoming_reqs: Vec<(i64, String)>,
 }
 
@@ -178,8 +178,14 @@ impl AppController {
                 state_lock
                     .messages
                     .entry(active_chat)
-                    .or_insert_with(Vec::new)
-                    .push((msg_uuid.to_string(), my_id, text_str.clone(), true, 0));
+                    .or_default()
+                    .push(ChatMessage {
+                        id: msg_uuid,
+                        sender_chat_id: my_id,
+                        text: text_str.clone(),
+                        outgoing: true,
+                        status: DeliveryStatus::Sending,
+                    });
 
                 request_scroll(&self.ui);
 
@@ -220,23 +226,21 @@ impl AppController {
                 model.set_vec(Vec::new());
 
                 if let Some(msgs) = state_lock.messages.get(&chat_id_i64) {
-                    let mut unread_uuids = Vec::new();
-                    for (uuid, _sender, text, is_out, status) in msgs {
+                    let mut unread_ids = Vec::new();
+                    for msg in msgs {
                         model.push(MessageEntry {
-                            text: text.clone().into(),
-                            is_outgoing: *is_out,
-                            status: *status,
+                            text: msg.text.clone().into(),
+                            is_outgoing: msg.outgoing,
+                            status: msg.status as i32,
                         });
-                        if !is_out && *status < 2 {
-                            unread_uuids.push(uuid.clone());
+                        if !msg.outgoing && msg.status < DeliveryStatus::Read {
+                            unread_ids.push(msg.id);
                         }
                     }
                     let guard = self.sender_slot.lock().unwrap();
                     if let Some(tx) = guard.as_ref() {
-                        for uuid in unread_uuids {
-                            if let Ok(id) = uuid.parse::<Uuid>() {
-                                let _ = tx.send(ClientMsg::MarkRead { message_id: id });
-                            }
+                        for id in unread_ids {
+                            let _ = tx.send(ClientMsg::MarkRead { message_id: id });
                         }
                     }
                 }
@@ -353,22 +357,22 @@ impl AppController {
                 for e in entries {
                     let is_out = e.sender_chat_id == state_lock.my_chat_id;
                     let status = match (is_out, e.is_read) {
-                        (_, true) => 2,
-                        (true, false) => 1,
-                        (false, false) => 0,
+                        (_, true) => DeliveryStatus::Read,
+                        (true, false) => DeliveryStatus::Sent,
+                        (false, false) => DeliveryStatus::Sending,
                     };
                     msgs.push(MessageEntry {
                         text: e.content.clone().into(),
                         is_outgoing: is_out,
+                        status: status as i32,
+                    });
+                    stored.push(ChatMessage {
+                        id: e.message_id,
+                        sender_chat_id: e.sender_chat_id,
+                        text: e.content,
+                        outgoing: is_out,
                         status,
                     });
-                    stored.push((
-                        e.message_id.to_string(),
-                        e.sender_chat_id,
-                        e.content,
-                        is_out,
-                        status,
-                    ));
                 }
                 state_lock.messages.insert(peer_chat_id, stored);
                 let chat_id_i32 = peer_chat_id as i32;
@@ -555,9 +559,9 @@ impl AppController {
                 ServerMsg::MsgAck { message_id } => {
                     'scan: for msgs in state_lock.messages.values_mut() {
                         for m in msgs.iter_mut() {
-                            if m.0 == message_id.to_string() {
-                                if m.4 < 1 {
-                                    m.4 = 1;
+                            if m.id == message_id {
+                                if m.status < DeliveryStatus::Sent {
+                                    m.status = DeliveryStatus::Sent;
                                 }
                                 break 'scan;
                             }
@@ -585,9 +589,9 @@ impl AppController {
                 ServerMsg::MsgRead { message_id } => {
                     'scan: for msgs in state_lock.messages.values_mut() {
                         for m in msgs.iter_mut() {
-                            if m.0 == message_id.to_string() {
-                                if m.4 < 2 {
-                                    m.4 = 2;
+                            if m.id == message_id {
+                                if m.status < DeliveryStatus::Read {
+                                    m.status = DeliveryStatus::Read;
                                 }
                                 break 'scan;
                             }
@@ -619,12 +623,18 @@ impl AppController {
                     timestamp: _ts,
                     content,
                 } => {
-                    let uuid_str = message_id.to_string();
+                    let message = ChatMessage {
+                        id: message_id,
+                        sender_chat_id,
+                        text: content.clone(),
+                        outgoing: false,
+                        status: DeliveryStatus::Sending,
+                    };
                     state_lock
                         .messages
                         .entry(sender_chat_id)
-                        .or_insert_with(Vec::new)
-                        .push((uuid_str.clone(), sender_chat_id, content.clone(), false, 0));
+                        .or_default()
+                        .push(message);
 
                     if state_lock.active_chat_id == sender_chat_id {
                         let text_clone = content.clone();
@@ -683,10 +693,10 @@ fn build_model_msgs(state: &ChatState, chat_id: i64) -> Vec<MessageEntry> {
         .get(&chat_id)
         .map(|msgs| {
             msgs.iter()
-                .map(|(_, _, text, is_out, status)| MessageEntry {
-                    text: text.clone().into(),
-                    is_outgoing: *is_out,
-                    status: *status,
+                .map(|m| MessageEntry {
+                    text: m.text.clone().into(),
+                    is_outgoing: m.outgoing,
+                    status: m.status as i32,
                 })
                 .collect()
         })
