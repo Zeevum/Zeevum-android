@@ -2,7 +2,6 @@ mod controller;
 mod network;
 mod settings;
 mod types;
-mod ui;
 
 use anyhow::Result;
 use slint::{include_modules, ModelRc, VecModel};
