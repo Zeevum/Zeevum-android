@@ -1,5 +1,5 @@
-use slint::{Model, VecModel};
 use chrono::Local;
+use slint::{Model, VecModel};
 
 use crate::types::LogColor;
 use crate::{LogEntry, MainWindow};

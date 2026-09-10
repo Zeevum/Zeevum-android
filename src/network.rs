@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+use tokio::io::{split, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -12,7 +12,7 @@ use rustls_native_certs::load_native_certs;
 use rustls_pki_types::ServerName;
 
 use Zeevum_protocol::{
-    AuthMethod, ClientMsg, ServerMsg, MAX_LINE_BYTES, PROTOCOL_VERSION, decode, encode, pow,
+    decode, encode, pow, AuthMethod, ClientMsg, ServerMsg, MAX_LINE_BYTES, PROTOCOL_VERSION,
 };
 
 use crate::controller::AppController;

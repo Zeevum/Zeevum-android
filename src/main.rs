@@ -4,9 +4,9 @@ mod settings;
 mod types;
 mod ui;
 
-use std::rc::Rc;
 use anyhow::Result;
 use slint::{include_modules, ModelRc, VecModel};
+use std::rc::Rc;
 
 include_modules!();
 
