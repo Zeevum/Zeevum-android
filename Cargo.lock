@@ -6,7 +6,6 @@ version = 4
 name = "Zeevum-android"
 version = "0.1.0"
 dependencies = [
- "Zeevum-protocol",
  "anyhow",
  "chrono",
  "dirs",
@@ -20,19 +19,8 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "uuid",
+ "zeevum-protocol",
  "zxcvbn",
-]
-
-[[package]]
-name = "Zeevum-protocol"
-version = "0.1.0"
-source = "git+https://github.com/Zeevum/Zeevum-protocol?tag=v0.1.0#f604be6a2836d9a0c0183972777091dff6075cdf"
-dependencies = [
- "rand 0.10.2",
- "serde",
- "serde_json",
- "sha2",
- "uuid",
 ]
 
 [[package]]
@@ -6656,6 +6644,18 @@ dependencies = [
  "serde",
  "zbus_names",
  "zvariant",
+]
+
+[[package]]
+name = "zeevum-protocol"
+version = "0.1.1"
+source = "git+https://github.com/Zeevum/zeevum-protocol?branch=dev#6dc01461984e28f4c1bedc05cfade808745fd5a9"
+dependencies = [
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
 ]
 
 [[package]]
