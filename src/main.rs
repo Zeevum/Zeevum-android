@@ -15,14 +15,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     app.set_friends_list(ModelRc::from(Rc::new(VecModel::default())));
     app.set_active_chat_messages(ModelRc::from(Rc::new(VecModel::default())));
-    app.set_log(ModelRc::from(Rc::new(VecModel::default())));
 
     let controller = controller::AppController::new(app.as_weak());
 
-    // Пытаемся автологин
     controller.try_auto_login();
 
-    // Привязка колбэков
     {
         let controller = controller.clone();
         app.on_connect(move |addr, login, pass, is_reg| {

@@ -6,10 +6,10 @@ use uuid::Uuid;
 
 use crate::network::network_task;
 use crate::settings;
-use crate::types::{CmdSender, UiEvent};
+use crate::types::{ChatMessage, CmdSender, DeliveryStatus, UiEvent};
 use crate::{FriendEntry, MainWindow, MessageEntry};
 
-use Zeevum_protocol::{ClientMsg, ServerMsg};
+use zeevum_protocol::{ClientMsg, ErrorCode, ServerMsg, UserBrief, MAX_MESSAGE_LEN};
 
 #[derive(Clone)]
 pub struct AppController {
@@ -19,13 +19,34 @@ pub struct AppController {
 }
 
 pub struct ChatState {
-    pub my_chat_id: i64,
-    pub active_chat_id: i64,
+    pub my_user_id: i64,
+    /// Собеседник открытого диалога. `None` - ничего не открыто. UI адресует
+    /// диалог по человеку (список друзей даёт `user_id`), поэтому это ровно
+    /// то, что лежит в свойстве `MainWindow.active-peer-id`.
+    pub active_peer_id: Option<i64>,
+    /// Логин собеседника открытого диалога. Нужен затем же, зачем
+    /// `active_peer_id`, чтобы на `NotFriends` можно было предложить
+    /// отправить заявку, назвав человека по имени.
+    pub active_peer_login: String,
+    /// Разговор открытого диалога. `None`, пока сервер не ответил на
+    /// `ResolveDm`. Путать с `active_peer_id` нельзя, человек и разговор -
+    /// разные вещи, в групповых чатах это станет видно окончательно.
+    pub active_conv: Option<Uuid>,
+    /// человек → разговор. Кэш, чтобы не спрашивать сервер каждый раз,
+    /// когда открываем уже открывавшийся диалог.
+    pub conv: HashMap<i64, Uuid>,
     pub server_addr: String,
     pub login: String,
-    pub friends: Vec<(i64, String)>,
-    pub messages: HashMap<i64, Vec<(String, i64, String, bool, i32)>>,
-    pub incoming_reqs: Vec<(i64, String)>,
+    pub friends: Vec<UserBrief>,
+    /// Сообщения по разговорам, а не по собеседникам.
+    pub messages: HashMap<Uuid, Vec<ChatMessage>>,
+    pub incoming_reqs: Vec<UserBrief>,
+    /// Непрочитанные входящие по собеседнику.
+    ///
+    /// Живёт в состоянии, а не в UI-модели: модель списка друзей целиком
+    /// пересобирается из состояния (`sync_friends`), поэтому счётчик, который
+    /// хранится в виджете, терялся бы при каждой пересборке.
+    pub unread: HashMap<i64, usize>,
 }
 
 impl AppController {
@@ -34,13 +55,17 @@ impl AppController {
             ui,
             sender_slot: Arc::new(Mutex::new(None)),
             state: Arc::new(Mutex::new(ChatState {
-                my_chat_id: 0,
-                active_chat_id: -1,
+                my_user_id: 0,
+                active_peer_id: None,
+                active_peer_login: String::new(),
+                active_conv: None,
+                conv: HashMap::new(),
                 server_addr: String::new(),
                 login: String::new(),
                 friends: Vec::new(),
                 messages: HashMap::new(),
                 incoming_reqs: Vec::new(),
+                unread: HashMap::new(),
             })),
         }
     }
@@ -102,7 +127,7 @@ impl AppController {
             &addr_str,
             &login_str,
             existing.token.as_deref().unwrap_or(""),
-            existing.chat_id.unwrap_or(0),
+            existing.user_id.unwrap_or(0),
             existing.expires_at.unwrap_or(0),
         );
 
@@ -167,108 +192,89 @@ impl AppController {
 
     pub fn handle_send_msg(&self, text: SharedString) {
         let text_str = text.to_string();
+
+        if text_str.len() > MAX_MESSAGE_LEN {
+            let ui_weak = self.ui.clone();
+            slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_status_message(
+                        format!("Message is too long: {MAX_MESSAGE_LEN} bytes maximum.").into(),
+                    );
+                }
+            })
+            .ok();
+            return;
+        }
+
         let mut state_lock = self.state.lock().unwrap();
 
+        let Some(conv_id) = state_lock.active_conv else {
+            return;
+        };
+
         if let Some(ui) = self.ui.upgrade() {
-            let active_chat = ui.get_active_chat_id() as i64;
-            if active_chat != -1 {
-                let msg_uuid = Uuid::new_v4();
+            let msg_uuid = Uuid::new_v4();
+            let my_id = state_lock.my_user_id;
+            state_lock
+                .messages
+                .entry(conv_id)
+                .or_default()
+                .push(ChatMessage {
+                    id: msg_uuid,
+                    sender_user_id: my_id,
+                    text: text_str.clone(),
+                    outgoing: true,
+                    status: DeliveryStatus::Sending,
+                });
 
-                let my_id = state_lock.my_chat_id;
-                state_lock
-                    .messages
-                    .entry(active_chat)
-                    .or_insert_with(Vec::new)
-                    .push((msg_uuid.to_string(), my_id, text_str.clone(), true, 0));
+            sync_messages_now(&ui, &state_lock);
+            request_scroll(&self.ui);
 
-                request_scroll(&self.ui);
-
-                let model = ui.get_active_chat_messages();
-                if let Some(model) = model.as_any().downcast_ref::<VecModel<MessageEntry>>() {
-                    model.push(MessageEntry {
-                        text: text_str.clone().into(),
-                        is_outgoing: true,
-                        status: 0,
-                    });
-                }
-
-                let guard = self.sender_slot.lock().unwrap();
-                if let Some(tx) = guard.as_ref() {
-                    let _ = tx.send(ClientMsg::SendMsg {
-                        message_id: msg_uuid,
-                        peer_chat_id: active_chat,
-                        content: text_str,
-                    });
-                }
+            let guard = self.sender_slot.lock().unwrap();
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(ClientMsg::SendMsg {
+                    message_id: msg_uuid,
+                    conv_id,
+                    content: text_str,
+                });
             }
         }
     }
 
-    pub fn handle_open_chat(&self, chat_id: i32, login: SharedString) {
+    pub fn handle_open_chat(&self, peer_user_id: i32, login: SharedString) {
         let mut state_lock = self.state.lock().unwrap();
-        let chat_id_i64 = chat_id as i64;
+        let peer = peer_user_id as i64;
         let ui_weak = self.ui.clone();
 
-        state_lock.active_chat_id = chat_id_i64;
+        state_lock.active_peer_id = Some(peer);
+        state_lock.active_peer_login = login.to_string();
+        state_lock.active_conv = state_lock.conv.get(&peer).copied();
+        state_lock.unread.insert(peer, 0);
 
         if let Some(ui) = self.ui.upgrade() {
-            ui.set_active_chat_id(chat_id);
-            ui.set_active_chat_login(login);
+            ui.set_active_peer_id(peer_user_id);
+            ui.set_active_peer_login(login);
+            sync_messages_now(&ui, &state_lock);
+        }
 
-            let model = ui.get_active_chat_messages();
-            if let Some(model) = model.as_any().downcast_ref::<VecModel<MessageEntry>>() {
-                model.set_vec(Vec::new());
-
-                if let Some(msgs) = state_lock.messages.get(&chat_id_i64) {
-                    let mut unread_uuids = Vec::new();
-                    for (uuid, _sender, text, is_out, status) in msgs {
-                        model.push(MessageEntry {
-                            text: text.clone().into(),
-                            is_outgoing: *is_out,
-                            status: *status,
-                        });
-                        if !is_out && *status < 2 {
-                            unread_uuids.push(uuid.clone());
+        {
+            let guard = self.sender_slot.lock().unwrap();
+            if let Some(tx) = guard.as_ref() {
+                match state_lock.active_conv {
+                    Some(conv_id) => {
+                        let _ = tx.send(ClientMsg::HistoryReq { conv_id });
+                        for id in unread_message_ids(&state_lock) {
+                            let _ = tx.send(ClientMsg::MarkRead { message_id: id });
                         }
                     }
-                    let guard = self.sender_slot.lock().unwrap();
-                    if let Some(tx) = guard.as_ref() {
-                        for uuid in unread_uuids {
-                            if let Ok(id) = uuid.parse::<Uuid>() {
-                                let _ = tx.send(ClientMsg::MarkRead { message_id: id });
-                            }
-                        }
+                    None => {
+                        let _ = tx.send(ClientMsg::ResolveDm { peer_user_id: peer });
                     }
                 }
-
-                let guard = self.sender_slot.lock().unwrap();
-                if let Some(tx) = guard.as_ref() {
-                    let _ = tx.send(ClientMsg::HistoryReq {
-                        peer_chat_id: chat_id_i64,
-                    });
-                }
-            }
-
-            if let Some(idx) = state_lock
-                .friends
-                .iter()
-                .position(|(id, _)| *id == chat_id_i64)
-            {
-                slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_weak.upgrade() {
-                        let model = ui.get_friends_list();
-                        if let Some(model) = model.as_any().downcast_ref::<VecModel<FriendEntry>>()
-                        {
-                            if let Some(mut entry) = model.row_data(idx) {
-                                entry.unread = 0;
-                                model.set_row_data(idx, entry);
-                            }
-                        }
-                    }
-                })
-                .ok();
             }
         }
+
+        sync_friends(&ui_weak, &state_lock);
     }
 
     pub fn handle_search_user(&self, login: SharedString) {
@@ -287,18 +293,20 @@ impl AppController {
         settings::clear_session();
         {
             let mut state_lock = self.state.lock().unwrap();
-            state_lock.active_chat_id = -1;
-            state_lock.my_chat_id = 0;
+            state_lock.active_peer_id = None;
+            state_lock.active_peer_login.clear();
+            state_lock.active_conv = None;
+            state_lock.conv.clear();
+            state_lock.my_user_id = 0;
             state_lock.messages.clear();
+            state_lock.unread.clear();
         }
+        let state_lock = self.state.lock().unwrap();
         if let Some(ui) = self.ui.upgrade() {
             ui.set_current_screen(0);
-            ui.set_active_chat_id(-1);
-            ui.set_active_chat_login("".into());
-            let model = ui.get_active_chat_messages();
-            if let Some(model) = model.as_any().downcast_ref::<VecModel<MessageEntry>>() {
-                model.set_vec(Vec::new());
-            }
+            ui.set_active_peer_id(-1);
+            ui.set_active_peer_login("".into());
+            sync_messages_now(&ui, &state_lock);
         }
     }
 
@@ -314,7 +322,7 @@ impl AppController {
             &addr_str,
             &login_str,
             settings.token.unwrap_or_default().as_str(),
-            settings.chat_id.unwrap_or(0),
+            settings.user_id.unwrap_or(0),
             settings.expires_at.unwrap_or(0),
         );
     }
@@ -326,79 +334,67 @@ impl AppController {
 
         match event {
             UiEvent::Disconnected(msg) => {
-                state_lock.active_chat_id = -1;
-                state_lock.my_chat_id = 0;
+                state_lock.active_peer_id = None;
+                state_lock.active_peer_login.clear();
+                state_lock.active_conv = None;
+                state_lock.conv.clear();
+                state_lock.my_user_id = 0;
                 state_lock.messages.clear();
+                state_lock.unread.clear();
+                let weak = ui_weak.clone();
                 slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_weak.upgrade() {
+                    if let Some(ui) = weak.upgrade() {
                         ui.set_status_message(msg.into());
                         ui.set_current_screen(0);
-                        ui.set_active_chat_id(-1);
-                        ui.set_active_chat_login("".into());
-                        let model = ui.get_active_chat_messages();
-                        if let Some(model) = model.as_any().downcast_ref::<VecModel<MessageEntry>>()
-                        {
-                            model.set_vec(Vec::new());
-                        }
+                        ui.set_active_peer_id(-1);
+                        ui.set_active_peer_login("".into());
                     }
                 })
                 .ok();
+                sync_messages(&ui_weak, &state_lock);
             }
-            UiEvent::HistoryBatch {
-                peer_chat_id,
-                entries,
-            } => {
-                let mut msgs = Vec::new();
+            UiEvent::HistoryBatch { conv_id, entries } => {
                 let mut stored = Vec::new();
                 for e in entries {
-                    let is_out = e.sender_chat_id == state_lock.my_chat_id;
+                    let is_out = e.sender_user_id == state_lock.my_user_id;
                     let status = match (is_out, e.is_read) {
-                        (_, true) => 2,
-                        (true, false) => 1,
-                        (false, false) => 0,
+                        (_, true) => DeliveryStatus::Read,
+                        (true, false) => DeliveryStatus::Sent,
+                        (false, false) => DeliveryStatus::Sending,
                     };
-                    msgs.push(MessageEntry {
-                        text: e.content.clone().into(),
-                        is_outgoing: is_out,
+                    stored.push(ChatMessage {
+                        id: e.message_id,
+                        sender_user_id: e.sender_user_id,
+                        text: e.content,
+                        outgoing: is_out,
                         status,
                     });
-                    stored.push((
-                        e.message_id.to_string(),
-                        e.sender_chat_id,
-                        e.content,
-                        is_out,
-                        status,
-                    ));
                 }
-                state_lock.messages.insert(peer_chat_id, stored);
-                let chat_id_i32 = peer_chat_id as i32;
+                state_lock.messages.insert(conv_id, stored);
+                sync_messages(&ui_weak, &state_lock);
                 request_scroll(&self.ui);
-                slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_weak.upgrade() {
-                        if ui.get_active_chat_id() == chat_id_i32 {
-                            let model = ui.get_active_chat_messages();
-                            if let Some(model) =
-                                model.as_any().downcast_ref::<VecModel<MessageEntry>>()
-                            {
-                                model.set_vec(msgs);
-                            }
+
+                if state_lock.active_conv == Some(conv_id) {
+                    let guard = sender_slot.lock().unwrap();
+                    if let Some(tx) = guard.as_ref() {
+                        for id in unread_message_ids(&state_lock) {
+                            let _ = tx.send(ClientMsg::MarkRead { message_id: id });
                         }
                     }
-                })
-                .ok();
+                }
             }
             UiEvent::Server(msg) => match msg {
                 ServerMsg::AuthOk {
-                    chat_id,
+                    user_id,
                     token,
                     expires_at,
                 } => {
-                    state_lock.my_chat_id = chat_id;
+                    state_lock.my_user_id = user_id;
                     settings::save_session(
                         &state_lock.server_addr,
                         &state_lock.login,
                         &token,
-                        chat_id,
+                        user_id,
                         expires_at,
                     );
                     slint::invoke_from_event_loop(move || {
@@ -408,47 +404,90 @@ impl AppController {
                     })
                     .ok();
                 }
-                ServerMsg::AuthFailed { reason } => {
-                    slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_weak.upgrade() {
-                            ui.set_status_message(reason.into());
-                            ui.set_current_screen(0);
-                        }
-                    })
-                    .ok();
-                }
-                ServerMsg::FriendList { entries } => {
-                    state_lock.friends = entries
-                        .iter()
-                        .map(|u| (u.chat_id, u.login.clone()))
-                        .collect();
-                    let list = entries.clone();
-                    slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_weak.upgrade() {
-                            let model = ui.get_friends_list();
-                            if let Some(model) =
-                                model.as_any().downcast_ref::<VecModel<FriendEntry>>()
-                            {
-                                model.set_vec(
-                                    list.iter()
-                                        .map(|u| FriendEntry {
-                                            login: u.login.clone().into(),
-                                            chat_id: u.chat_id as i32,
-                                            unread: 0,
-                                        })
-                                        .collect::<Vec<_>>(),
+                ServerMsg::Error {
+                    code,
+                    detail: _detail,
+                } => match code {
+                    ErrorCode::NotFriends => {
+                        let login = state_lock.active_peer_login.clone();
+                        forget_conversation(&mut state_lock);
+                        sync_messages(&ui_weak, &state_lock);
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_weak.upgrade() {
+                                ui.set_search_result(
+                                    format!("You are not friends with {login}. Search for '{login}' to send a request.")
+                                        .into(),
                                 );
                             }
+                        })
+                            .ok();
+                    }
+                    ErrorCode::NotAMember => {
+                        forget_conversation(&mut state_lock);
+                        sync_messages(&ui_weak, &state_lock);
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_weak.upgrade() {
+                                ui.set_status_message(
+                                    "You are no longer a member of this conversation.".into(),
+                                );
+                            }
+                        })
+                        .ok();
+                    }
+                    ErrorCode::ConversationNotFound => {
+                        forget_conversation(&mut state_lock);
+                        let peer = state_lock.active_peer_id;
+                        sync_messages(&ui_weak, &state_lock);
+                        if let Some(peer) = peer {
+                            let guard = sender_slot.lock().unwrap();
+                            if let Some(tx) = guard.as_ref() {
+                                let _ = tx.send(ClientMsg::ResolveDm { peer_user_id: peer });
+                            }
                         }
-                    })
-                    .ok();
+                    }
+                    ErrorCode::AlreadyFriends
+                    | ErrorCode::NoPendingRequest
+                    | ErrorCode::CannotTargetYourself
+                    | ErrorCode::UserNotFound => {
+                        let text = code.to_string();
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_weak.upgrade() {
+                                ui.set_search_result(text.into());
+                            }
+                        })
+                        .ok();
+                    }
+                    ErrorCode::MessageTooLong => {
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_weak.upgrade() {
+                                ui.set_status_message("Message is too long.".into());
+                            }
+                        })
+                        .ok();
+                    }
+                    ErrorCode::UnsupportedProtocolVersion { .. }
+                    | ErrorCode::InvalidCredentials
+                    | ErrorCode::RegistrationFailed
+                    | ErrorCode::MalformedFrame
+                    | ErrorCode::Internal => {
+                        let text = code.to_string();
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_weak.upgrade() {
+                                ui.set_status_message(text.into());
+                                ui.set_current_screen(0);
+                            }
+                        })
+                        .ok();
+                    }
+                },
+                ServerMsg::FriendList { entries } => {
+                    state_lock.unread.clear();
+                    state_lock.friends = entries;
+                    sync_friends(&ui_weak, &state_lock);
                 }
                 ServerMsg::PendingReqs { entries } => {
-                    state_lock.incoming_reqs = entries
-                        .iter()
-                        .map(|u| (u.chat_id, u.login.clone()))
-                        .collect();
                     let names: Vec<String> = entries.iter().map(|u| u.login.clone()).collect();
+                    state_lock.incoming_reqs = entries;
                     if !names.is_empty() {
                         slint::invoke_from_event_loop(move || {
                             if let Some(ui) = ui_weak.upgrade() {
@@ -462,8 +501,8 @@ impl AppController {
                     }
                 }
                 ServerMsg::IncomingReq { from } => {
-                    let (chat_id, login) = (from.chat_id, from.login.clone());
-                    state_lock.incoming_reqs.push((chat_id, login.clone()));
+                    let login = from.login.clone();
+                    state_lock.incoming_reqs.push(from);
                     slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_weak.upgrade() {
                             ui.set_search_result(
@@ -478,45 +517,31 @@ impl AppController {
                     .ok();
                 }
                 ServerMsg::FriendAdded { user } => {
-                    let (chat_id, login) = (user.chat_id, user.login.clone());
-                    if !state_lock.friends.iter().any(|(id, _)| *id == chat_id) {
-                        state_lock.friends.push((chat_id, login.clone()));
-                        slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui_weak.upgrade() {
-                                let model = ui.get_friends_list();
-                                if let Some(model) =
-                                    model.as_any().downcast_ref::<VecModel<FriendEntry>>()
-                                {
-                                    model.push(FriendEntry {
-                                        login: login.into(),
-                                        chat_id: chat_id as i32,
-                                        unread: 0,
-                                    });
-                                }
-                            }
-                        })
-                        .ok();
+                    let chat_id = user.user_id;
+                    if !state_lock.friends.iter().any(|f| f.user_id == chat_id) {
+                        state_lock.friends.push(user);
+                        sync_friends(&ui_weak, &state_lock);
                     }
                 }
                 ServerMsg::UserFound { user } => {
-                    let (chat_id, login) = (user.chat_id, user.login.clone());
+                    let (chat_id, login) = (user.user_id, user.login.clone());
                     let is_incoming = state_lock
                         .incoming_reqs
                         .iter()
-                        .any(|(id, _)| *id == chat_id);
-                    let is_friend = state_lock.friends.iter().any(|(id, _)| *id == chat_id);
+                        .any(|f| f.user_id == chat_id);
+                    let is_friend = state_lock.friends.iter().any(|f| f.user_id == chat_id);
                     {
                         let guard = sender_slot.lock().unwrap();
                         if let Some(tx) = guard.as_ref() {
                             if !is_friend {
                                 let _ = if is_incoming {
-                                    state_lock.incoming_reqs.retain(|(id, _)| *id != chat_id);
+                                    state_lock.incoming_reqs.retain(|f| f.user_id != chat_id);
                                     tx.send(ClientMsg::AcceptFriend {
-                                        target_chat_id: chat_id,
+                                        target_user_id: chat_id,
                                     })
                                 } else {
                                     tx.send(ClientMsg::FriendReq {
-                                        target_chat_id: chat_id,
+                                        target_user_id: chat_id,
                                     })
                                 };
                             }
@@ -536,6 +561,17 @@ impl AppController {
                     })
                     .ok();
                 }
+                ServerMsg::DmResolved { conv_id, peer } => {
+                    state_lock.conv.insert(peer.user_id, conv_id);
+                    if state_lock.active_peer_id == Some(peer.user_id) {
+                        state_lock.active_conv = Some(conv_id);
+                        sync_messages(&ui_weak, &state_lock);
+                        let guard = sender_slot.lock().unwrap();
+                        if let Some(tx) = guard.as_ref() {
+                            let _ = tx.send(ClientMsg::HistoryReq { conv_id });
+                        }
+                    }
+                }
                 ServerMsg::UserNotFound => {
                     slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_weak.upgrade() {
@@ -544,131 +580,63 @@ impl AppController {
                     })
                     .ok();
                 }
-                ServerMsg::Info { text } => {
-                    slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_weak.upgrade() {
-                            ui.set_search_result(text.into());
+                ServerMsg::MsgAck {
+                    message_id,
+                    conv_id,
+                } => {
+                    if let Some(msgs) = state_lock.messages.get_mut(&conv_id) {
+                        if let Some(m) = msgs.iter_mut().find(|m| m.id == message_id) {
+                            if m.status < DeliveryStatus::Sent {
+                                m.status = DeliveryStatus::Sent;
+                            }
                         }
-                    })
-                    .ok();
+                    }
+                    sync_messages(&ui_weak, &state_lock);
                 }
-                ServerMsg::MsgAck { message_id } => {
-                    'scan: for msgs in state_lock.messages.values_mut() {
-                        for m in msgs.iter_mut() {
-                            if m.0 == message_id.to_string() {
-                                if m.4 < 1 {
-                                    m.4 = 1;
-                                }
-                                break 'scan;
+                ServerMsg::MsgRead {
+                    message_id,
+                    conv_id,
+                } => {
+                    if let Some(msgs) = state_lock.messages.get_mut(&conv_id) {
+                        if let Some(m) = msgs.iter_mut().find(|m| m.id == message_id) {
+                            if m.status < DeliveryStatus::Read {
+                                m.status = DeliveryStatus::Read;
                             }
                         }
                     }
-                    let active = state_lock.active_chat_id;
-                    if active != -1 {
-                        let model_msgs = build_model_msgs(&state_lock, active);
-                        let chat_id_i32 = active as i32;
-                        slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui_weak.upgrade() {
-                                if ui.get_active_chat_id() == chat_id_i32 {
-                                    let model = ui.get_active_chat_messages();
-                                    if let Some(model) =
-                                        model.as_any().downcast_ref::<VecModel<MessageEntry>>()
-                                    {
-                                        model.set_vec(model_msgs);
-                                    }
-                                }
-                            }
-                        })
-                        .ok();
-                    }
-                }
-                ServerMsg::MsgRead { message_id } => {
-                    'scan: for msgs in state_lock.messages.values_mut() {
-                        for m in msgs.iter_mut() {
-                            if m.0 == message_id.to_string() {
-                                if m.4 < 2 {
-                                    m.4 = 2;
-                                }
-                                break 'scan;
-                            }
-                        }
-                    }
-                    let active = state_lock.active_chat_id;
-                    if active != -1 {
-                        let model_msgs = build_model_msgs(&state_lock, active);
-                        let chat_id_i32 = active as i32;
-                        slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui_weak.upgrade() {
-                                if ui.get_active_chat_id() == chat_id_i32 {
-                                    let model = ui.get_active_chat_messages();
-                                    if let Some(model) =
-                                        model.as_any().downcast_ref::<VecModel<MessageEntry>>()
-                                    {
-                                        model.set_vec(model_msgs);
-                                    }
-                                }
-                            }
-                        })
-                        .ok();
-                    }
+                    sync_messages(&ui_weak, &state_lock);
                 }
                 ServerMsg::RecvMsg {
                     message_id,
-                    chat_id: _proto_chat,
-                    sender_chat_id,
+                    conv_id,
+                    sender_user_id,
                     timestamp: _ts,
                     content,
                 } => {
-                    let uuid_str = message_id.to_string();
+                    let message = ChatMessage {
+                        id: message_id,
+                        sender_user_id,
+                        text: content.clone(),
+                        outgoing: false,
+                        status: DeliveryStatus::Sending,
+                    };
                     state_lock
                         .messages
-                        .entry(sender_chat_id)
-                        .or_insert_with(Vec::new)
-                        .push((uuid_str.clone(), sender_chat_id, content.clone(), false, 0));
+                        .entry(conv_id)
+                        .or_default()
+                        .push(message);
 
-                    if state_lock.active_chat_id == sender_chat_id {
-                        let text_clone = content.clone();
+                    if state_lock.active_conv == Some(conv_id) {
+                        sync_messages(&ui_weak, &state_lock);
                         request_scroll(&self.ui);
-                        slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui_weak.upgrade() {
-                                let model = ui.get_active_chat_messages();
-                                if let Some(model) =
-                                    model.as_any().downcast_ref::<VecModel<MessageEntry>>()
-                                {
-                                    model.push(MessageEntry {
-                                        text: text_clone.into(),
-                                        is_outgoing: false,
-                                        status: 0,
-                                    });
-                                }
-                            }
-                        })
-                        .ok();
                         let guard = sender_slot.lock().unwrap();
                         if let Some(tx) = guard.as_ref() {
                             let _ = tx.send(ClientMsg::MarkRead { message_id });
                         }
                     } else {
-                        let chat_id_i32 = sender_chat_id as i32;
-                        slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui_weak.upgrade() {
-                                let model = ui.get_friends_list();
-                                if let Some(model) =
-                                    model.as_any().downcast_ref::<VecModel<FriendEntry>>()
-                                {
-                                    for i in 0..model.row_count() {
-                                        if let Some(mut entry) = model.row_data(i) {
-                                            if entry.chat_id == chat_id_i32 {
-                                                entry.unread += 1;
-                                                model.set_row_data(i, entry);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        })
-                        .ok();
+                        // Чат не открыт — считаем непрочитанное в состоянии.
+                        *state_lock.unread.entry(sender_user_id).or_insert(0) += 1;
+                        sync_friends(&ui_weak, &state_lock);
                     }
                 }
                 _ => {}
@@ -677,16 +645,113 @@ impl AppController {
     }
 }
 
-fn build_model_msgs(state: &ChatState, chat_id: i64) -> Vec<MessageEntry> {
+/// Модель списка друзей, целиком построенная из состояния.
+fn build_model_friends(state: &ChatState) -> Vec<FriendEntry> {
     state
-        .messages
-        .get(&chat_id)
+        .friends
+        .iter()
+        .map(|f| FriendEntry {
+            login: f.login.clone().into(),
+            user_id: f.user_id as i32,
+            unread: state.unread.get(&f.user_id).copied().unwrap_or(0) as i32,
+        })
+        .collect()
+}
+
+/// Модель сообщений открытого диалога. Диалог не открыт или разговор ещё
+/// не известен
+fn build_model_active(state: &ChatState) -> Vec<MessageEntry> {
+    state
+        .active_conv
+        .map(|conv_id| build_model_msgs(state, conv_id))
+        .unwrap_or_default()
+}
+
+/// Выбрасывает разговор открытого диалога, он больше недействителен.
+/// Сам диалог остаётся открытым - откроют заново или придёт
+/// `ConversationNotFound`, уйдёт новый `ResolveDm`.
+fn forget_conversation(state: &mut ChatState) {
+    if let Some(conv_id) = state.active_conv.take() {
+        state.messages.remove(&conv_id);
+    }
+    if let Some(peer) = state.active_peer_id {
+        state.conv.remove(&peer);
+    }
+}
+
+fn unread_message_ids(state: &ChatState) -> Vec<Uuid> {
+    state
+        .active_conv
+        .and_then(|conv_id| state.messages.get(&conv_id))
         .map(|msgs| {
             msgs.iter()
-                .map(|(_, _, text, is_out, status)| MessageEntry {
-                    text: text.clone().into(),
-                    is_outgoing: *is_out,
-                    status: *status,
+                .filter(|m| !m.outgoing && m.status < DeliveryStatus::Read)
+                .map(|m| m.id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Единственная точка записи в модель списка друзей
+fn sync_friends(ui_weak: &Weak<MainWindow>, state: &ChatState) {
+    let entries = build_model_friends(state);
+    let ui_weak = ui_weak.clone();
+    slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui_weak.upgrade() {
+            let model = ui.get_friends_list();
+            if let Some(model) = model.as_any().downcast_ref::<VecModel<FriendEntry>>() {
+                model.set_vec(entries);
+            }
+        }
+    })
+    .ok();
+}
+
+/// Единственная точка записи в модель сообщений, общая для `sync_messages` и `sync_messages_now`
+fn write_messages(ui: &MainWindow, peer_i32: i32, entries: Vec<MessageEntry>) {
+    if ui.get_active_peer_id() != peer_i32 {
+        return;
+    }
+    let model = ui.get_active_chat_messages();
+    if let Some(model) = model.as_any().downcast_ref::<VecModel<MessageEntry>>() {
+        model.set_vec(entries);
+    }
+}
+
+/// Для событий из сетевого таска: модель обновится, когда очередь дойдёт до UI-потока
+fn sync_messages(ui_weak: &Weak<MainWindow>, state: &ChatState) {
+    let entries = build_model_active(state);
+    let peer_i32 = state.active_peer_id.unwrap_or(-1) as i32;
+    let ui_weak = ui_weak.clone();
+    slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui_weak.upgrade() {
+            write_messages(&ui, peer_i32, entries);
+        }
+    })
+    .ok();
+}
+
+/// Для обработчиков, вызванных из UI-потока, им модель нужна уже актуальной
+/// к моменту возврата - иначе `request_scroll` прокрутит список, в котором
+/// нового сообщения ещё нет
+fn sync_messages_now(ui: &MainWindow, state: &ChatState) {
+    write_messages(
+        ui,
+        state.active_peer_id.unwrap_or(-1) as i32,
+        build_model_active(state),
+    );
+}
+
+fn build_model_msgs(state: &ChatState, conv_id: Uuid) -> Vec<MessageEntry> {
+    state
+        .messages
+        .get(&conv_id)
+        .map(|msgs| {
+            msgs.iter()
+                .map(|m| MessageEntry {
+                    text: m.text.clone().into(),
+                    is_outgoing: m.outgoing,
+                    status: m.status as i32,
                 })
                 .collect()
         })

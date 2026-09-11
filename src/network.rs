@@ -11,8 +11,8 @@ use rustls::ClientConfig;
 use rustls_native_certs::load_native_certs;
 use rustls_pki_types::ServerName;
 
-use Zeevum_protocol::{
-    decode, encode, pow, AuthMethod, ClientMsg, ServerMsg, MAX_LINE_BYTES, PROTOCOL_VERSION,
+use zeevum_protocol::{
+    decode, encode, pow, AuthMethod, ClientMsg, ConvId, ServerMsg, MAX_LINE_BYTES, PROTOCOL_VERSION,
 };
 
 use crate::controller::AppController;
@@ -161,12 +161,16 @@ pub async fn network_task(
                         }
                     }
                 }
-                ServerMsg::AuthOk { chat_id, token, expires_at } => {
-                    controller.handle_ui_event(UiEvent::Server(ServerMsg::AuthOk { chat_id, token, expires_at }));
+                ServerMsg::AuthOk { user_id, token, expires_at } => {
+                    controller.handle_ui_event(UiEvent::Server(ServerMsg::AuthOk {
+                        user_id,
+                        token,
+                        expires_at,
+                    }));
                     break;
                 }
-                ServerMsg::AuthFailed { reason } => {
-                    controller.handle_ui_event(UiEvent::Server(ServerMsg::AuthFailed { reason }));
+                ServerMsg::Error { code, detail } => {
+                    controller.handle_ui_event(UiEvent::Server(ServerMsg::Error { code, detail }));
                     return;
                 }
                 _ => {}
@@ -174,7 +178,7 @@ pub async fn network_task(
         }
 
         let mut history_buf: Vec<HistoryEntry> = Vec::new();
-        let mut history_chat_id: i64 = -1;
+        let mut history_conv_id: Option<ConvId> = None;
 
         loop {
             tokio::select! {
@@ -195,24 +199,22 @@ pub async fn network_task(
                                 }
                             };
                             match msg {
-                                ServerMsg::HistoryMsg { message_id, sender_chat_id, timestamp, content, is_read } => {
-                                    if history_chat_id != -1 {
+                                ServerMsg::HistoryMsg { message_id, conv_id, sender_user_id, timestamp, content, is_read } => {
+                                    if history_conv_id == Some(conv_id) {
                                         history_buf.push(HistoryEntry {
                                             message_id,
-                                            sender_chat_id,
+                                            sender_user_id,
                                             timestamp,
                                             content,
                                             is_read,
                                         });
                                     }
                                 }
-                                ServerMsg::HistoryEnd => {
-                                    let peer = history_chat_id;
-                                    let mut batch = std::mem::take(&mut history_buf);
-                                    batch.reverse();
-                                    history_chat_id = -1;
-                                    if peer != -1 {
-                                        controller.handle_ui_event(UiEvent::HistoryBatch { peer_chat_id: peer, entries: batch });
+                                ServerMsg::HistoryEnd { conv_id } => {
+                                    let requested = history_conv_id.take();
+                                    let batch = std::mem::take(&mut history_buf);
+                                    if requested == Some(conv_id) {
+                                        controller.handle_ui_event(UiEvent::HistoryBatch { conv_id, entries: batch });
                                     }
                                 }
                                 other => {
@@ -232,10 +234,10 @@ pub async fn network_task(
                 }
                 cmd_opt = cmd_rx.recv() => {
                     match cmd_opt {
-                        Some(ClientMsg::HistoryReq { peer_chat_id }) => {
-                            history_chat_id = peer_chat_id;
+                        Some(ClientMsg::HistoryReq { conv_id }) => {
+                            history_conv_id = Some(conv_id);
                             history_buf.clear();
-                            let frame = encode(&ClientMsg::HistoryReq { peer_chat_id })
+                            let frame = encode(&ClientMsg::HistoryReq { conv_id })
                                 .expect("ClientMsg serialization cannot fail");
                             if let Err(e) = write_frame(&mut tls_writer, &frame).await {
                                 controller.handle_ui_event(UiEvent::Disconnected(format!("Write error: {e}")));

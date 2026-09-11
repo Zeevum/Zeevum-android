@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-Zeevum-protocol = { git = "https://github.com/Zeevum/Zeevum-protocol", tag = "v0.1.0" }
+zeevum-protocol = { git = "https://github.com/Zeevum/zeevum-protocol", branch = "dev" }
 slint = { version = "1.17.1", features = ["compat-1-2", "backend-winit", "renderer-winit-software"] }
 tokio = { version = "1.53.1", features = ["rt", "net", "io-util", "macros", "time", "sync", "rt-multi-thread"] }
 anyhow = "1.0.104"
