@@ -153,7 +153,7 @@ impl AppController {
                     is_register,
                     rx_cmd,
                 )
-                    .await;
+                .await;
             });
         }
     }
@@ -202,7 +202,7 @@ impl AppController {
                     );
                 }
             })
-                .ok();
+            .ok();
             return;
         }
 
@@ -350,7 +350,7 @@ impl AppController {
                         ui.set_active_peer_login("".into());
                     }
                 })
-                    .ok();
+                .ok();
                 sync_messages(&ui_weak, &state_lock);
             }
             UiEvent::HistoryBatch { conv_id, entries } => {
@@ -402,7 +402,7 @@ impl AppController {
                             ui.set_current_screen(1);
                         }
                     })
-                        .ok();
+                    .ok();
                 }
                 ServerMsg::Error {
                     code,
@@ -432,7 +432,7 @@ impl AppController {
                                 );
                             }
                         })
-                            .ok();
+                        .ok();
                     }
                     ErrorCode::ConversationNotFound => {
                         forget_conversation(&mut state_lock);
@@ -455,7 +455,7 @@ impl AppController {
                                 ui.set_search_result(text.into());
                             }
                         })
-                            .ok();
+                        .ok();
                     }
                     ErrorCode::MessageTooLong => {
                         slint::invoke_from_event_loop(move || {
@@ -463,7 +463,7 @@ impl AppController {
                                 ui.set_status_message("Message is too long.".into());
                             }
                         })
-                            .ok();
+                        .ok();
                     }
                     ErrorCode::UnsupportedProtocolVersion { .. }
                     | ErrorCode::InvalidCredentials
@@ -477,7 +477,7 @@ impl AppController {
                                 ui.set_current_screen(0);
                             }
                         })
-                            .ok();
+                        .ok();
                     }
                 },
                 ServerMsg::FriendList { entries } => {
@@ -497,7 +497,7 @@ impl AppController {
                                 );
                             }
                         })
-                            .ok();
+                        .ok();
                     }
                 }
                 ServerMsg::IncomingReq { from } => {
@@ -510,11 +510,11 @@ impl AppController {
                                     "Incoming request from: {}. Search for '{}' to accept!",
                                     login, login
                                 )
-                                    .into(),
+                                .into(),
                             );
                         }
                     })
-                        .ok();
+                    .ok();
                 }
                 ServerMsg::FriendAdded { user } => {
                     let chat_id = user.user_id;
@@ -559,7 +559,7 @@ impl AppController {
                             ui.set_search_result(msg_text.into());
                         }
                     })
-                        .ok();
+                    .ok();
                 }
                 ServerMsg::DmResolved { conv_id, peer } => {
                     state_lock.conv.insert(peer.user_id, conv_id);
@@ -578,7 +578,7 @@ impl AppController {
                             ui.set_search_result("User not found.".into());
                         }
                     })
-                        .ok();
+                    .ok();
                 }
                 ServerMsg::MsgAck {
                     message_id,
@@ -704,7 +704,7 @@ fn sync_friends(ui_weak: &Weak<MainWindow>, state: &ChatState) {
             }
         }
     })
-        .ok();
+    .ok();
 }
 
 /// Единственная точка записи в модель сообщений, общая для `sync_messages` и `sync_messages_now`
@@ -728,7 +728,7 @@ fn sync_messages(ui_weak: &Weak<MainWindow>, state: &ChatState) {
             write_messages(&ui, peer_i32, entries);
         }
     })
-        .ok();
+    .ok();
 }
 
 /// Для обработчиков, вызванных из UI-потока, им модель нужна уже актуальной
