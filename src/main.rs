@@ -36,6 +36,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     {
         let controller = controller.clone();
+        app.on_logout(move || {
+            controller.handle_logout();
+        });
+    }
+
+    {
+        let controller = controller.clone();
         app.on_save_settings(move |addr| {
             controller.handle_save_settings(addr);
         });

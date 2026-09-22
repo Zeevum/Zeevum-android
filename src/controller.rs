@@ -20,32 +20,28 @@ pub struct AppController {
 
 pub struct ChatState {
     pub my_user_id: i64,
-    /// Собеседник открытого диалога. `None` - ничего не открыто. UI адресует
-    /// диалог по человеку (список друзей даёт `user_id`), поэтому это ровно
-    /// то, что лежит в свойстве `MainWindow.active-peer-id`.
+    /// Peer of the open dialog. `None` - nothing open. The UI addresses a
+    /// dialog by person, so this is what goes in `active-peer-id`.
     pub active_peer_id: Option<i64>,
-    /// Логин собеседника открытого диалога. Нужен затем же, зачем
-    /// `active_peer_id`, чтобы на `NotFriends` можно было предложить
-    /// отправить заявку, назвав человека по имени.
+    /// Login of the peer of the open dialog. Needed so `NotFriends` can
+    /// offer to send a request, naming the person.
     pub active_peer_login: String,
-    /// Разговор открытого диалога. `None`, пока сервер не ответил на
-    /// `ResolveDm`. Путать с `active_peer_id` нельзя, человек и разговор -
-    /// разные вещи, в групповых чатах это станет видно окончательно.
+    /// Conversation of the open dialog. `None` until the server answers
+    /// `ResolveDm`. Not the same thing as `active_peer_id`, a person and a
+    /// conversation are different.
     pub active_conv: Option<Uuid>,
-    /// человек → разговор. Кэш, чтобы не спрашивать сервер каждый раз,
-    /// когда открываем уже открывавшийся диалог.
+    /// Person to conversation. Cached so reopening a dialog does not ask
+    /// the server again.
     pub conv: HashMap<i64, Uuid>,
     pub server_addr: String,
     pub login: String,
     pub friends: Vec<UserBrief>,
-    /// Сообщения по разговорам, а не по собеседникам.
+    /// Messages by conversation, not by peer.
     pub messages: HashMap<Uuid, Vec<ChatMessage>>,
     pub incoming_reqs: Vec<UserBrief>,
-    /// Непрочитанные входящие по собеседнику.
-    ///
-    /// Живёт в состоянии, а не в UI-модели: модель списка друзей целиком
-    /// пересобирается из состояния (`sync_friends`), поэтому счётчик, который
-    /// хранится в виджете, терялся бы при каждой пересборке.
+    /// Lives in the state, not in the UI model. The friend list model is
+    /// rebuilt from that state, so a counter kept in a widget would be lost
+    /// on every rebuild.
     pub unread: HashMap<i64, usize>,
 }
 
@@ -308,6 +304,26 @@ impl AppController {
             ui.set_active_peer_login("".into());
             sync_messages_now(&ui, &state_lock);
         }
+    }
+
+    /// Revokes the session on the server, then forgets it locally.
+    ///
+    /// The frame has to go out before the token is erased. Without it the row
+    /// in `sessions` survives and the token stays valid on the server until it
+    /// expires -- a logout that never logged out.
+    ///
+    /// Deliberately not folded into `handle_disconnect`, which drops the
+    /// connection and the saved token but leaves the session alive upstream.
+    pub fn handle_logout(&self) {
+        {
+            let guard = self.sender_slot.lock().unwrap();
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(ClientMsg::Logout {
+                    all_sessions: false,
+                });
+            }
+        }
+        self.handle_disconnect();
     }
 
     pub fn handle_save_settings(&self, addr: SharedString) {
@@ -634,7 +650,6 @@ impl AppController {
                             let _ = tx.send(ClientMsg::MarkRead { message_id });
                         }
                     } else {
-                        // Чат не открыт — считаем непрочитанное в состоянии.
                         *state_lock.unread.entry(sender_user_id).or_insert(0) += 1;
                         sync_friends(&ui_weak, &state_lock);
                     }
@@ -645,7 +660,6 @@ impl AppController {
     }
 }
 
-/// Модель списка друзей, целиком построенная из состояния.
 fn build_model_friends(state: &ChatState) -> Vec<FriendEntry> {
     state
         .friends
@@ -658,8 +672,7 @@ fn build_model_friends(state: &ChatState) -> Vec<FriendEntry> {
         .collect()
 }
 
-/// Модель сообщений открытого диалога. Диалог не открыт или разговор ещё
-/// не известен
+/// Nothing open, or the conversation is not known yet.
 fn build_model_active(state: &ChatState) -> Vec<MessageEntry> {
     state
         .active_conv
@@ -667,9 +680,8 @@ fn build_model_active(state: &ChatState) -> Vec<MessageEntry> {
         .unwrap_or_default()
 }
 
-/// Выбрасывает разговор открытого диалога, он больше недействителен.
-/// Сам диалог остаётся открытым - откроют заново или придёт
-/// `ConversationNotFound`, уйдёт новый `ResolveDm`.
+/// The dialog itself stays open, it gets reopened, or `ConversationNotFound`
+/// arrives and a new `ResolveDm` goes out.
 fn forget_conversation(state: &mut ChatState) {
     if let Some(conv_id) = state.active_conv.take() {
         state.messages.remove(&conv_id);
@@ -692,7 +704,7 @@ fn unread_message_ids(state: &ChatState) -> Vec<Uuid> {
         .unwrap_or_default()
 }
 
-/// Единственная точка записи в модель списка друзей
+/// The only place that writes the friend list model.
 fn sync_friends(ui_weak: &Weak<MainWindow>, state: &ChatState) {
     let entries = build_model_friends(state);
     let ui_weak = ui_weak.clone();
@@ -707,7 +719,7 @@ fn sync_friends(ui_weak: &Weak<MainWindow>, state: &ChatState) {
     .ok();
 }
 
-/// Единственная точка записи в модель сообщений, общая для `sync_messages` и `sync_messages_now`
+/// The only place that writes the message model, shared by `sync_messages` and `sync_messages_now`.
 fn write_messages(ui: &MainWindow, peer_i32: i32, entries: Vec<MessageEntry>) {
     if ui.get_active_peer_id() != peer_i32 {
         return;
@@ -718,7 +730,7 @@ fn write_messages(ui: &MainWindow, peer_i32: i32, entries: Vec<MessageEntry>) {
     }
 }
 
-/// Для событий из сетевого таска: модель обновится, когда очередь дойдёт до UI-потока
+/// For events from the network task. The model updates once the queue reaches the UI thread.
 fn sync_messages(ui_weak: &Weak<MainWindow>, state: &ChatState) {
     let entries = build_model_active(state);
     let peer_i32 = state.active_peer_id.unwrap_or(-1) as i32;
@@ -731,9 +743,9 @@ fn sync_messages(ui_weak: &Weak<MainWindow>, state: &ChatState) {
     .ok();
 }
 
-/// Для обработчиков, вызванных из UI-потока, им модель нужна уже актуальной
-/// к моменту возврата - иначе `request_scroll` прокрутит список, в котором
-/// нового сообщения ещё нет
+/// For handlers called from the UI thread. They need the model current by
+/// the time they return, or `request_scroll` scrolls a list that does not
+/// have the new message yet.
 fn sync_messages_now(ui: &MainWindow, state: &ChatState) {
     write_messages(
         ui,

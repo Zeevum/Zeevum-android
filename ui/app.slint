@@ -273,6 +273,7 @@ export component MainWindow inherits Window {
 
                 Button { text: "🔍 Search User"; clicked => { root.current-screen = 3; } }
                 Button { text: "Disconnect"; clicked => { root.disconnect(); } }
+                Button { text: "Log out"; clicked => { root.logout(); } }
             }
         }
 
@@ -347,6 +348,7 @@ export component MainWindow inherits Window {
 
     callback connect(string, string, string, bool);
     callback disconnect();
+    callback logout();
     callback save-settings(string);
     callback check-password-strength(string);
     callback search-user(string);
