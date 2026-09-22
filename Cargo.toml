@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 zeevum-protocol = { git = "https://github.com/Zeevum/zeevum-protocol", branch = "dev" }
-slint = { version = "1.17.1", features = ["compat-1-2", "backend-winit", "renderer-winit-software"] }
+slint = { version = "1.18.1", features = ["compat-1-2", "backend-winit", "renderer-winit-software"] }
 tokio = { version = "1.53.1", features = ["rt", "net", "io-util", "macros", "time", "sync", "rt-multi-thread"] }
 anyhow = "1.0.104"
 chrono = "0.4.45"
@@ -20,7 +20,7 @@ uuid = { version = "1.23.2", features = ["v4"] }
 zxcvbn = "3.1.1"
 
 [build-dependencies]
-slint-build = "1.17.1"
+slint-build = "1.18.1"
 
 [profile.release]
 opt-level = "z"

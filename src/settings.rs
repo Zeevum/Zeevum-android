@@ -101,12 +101,12 @@ mod tests {
         let path = std::env::temp_dir().join(format!("zeevum-settings-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
-        write_private(&path, "{\"token\":\"secret\"}").unwrap();
+        super::write_private(&path, "{\"token\":\"secret\"}").unwrap();
         let created = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(created & 0o777, 0o600);
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        tighten_permissions(&path);
+        super::tighten_permissions(&path);
         let tightened = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(tightened & 0o777, 0o600);
 

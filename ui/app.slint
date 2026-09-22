@@ -302,9 +302,9 @@ export component MainWindow inherits Window {
                     ScrollView {
                         vertical-stretch: 1;
                         chat-list := ListView {
-                            changed viewport-height => {
-                                if (root.scroll-pending && self.viewport-height > 0) {
-                                    self.viewport-y = self.height - self.viewport-height;
+                            changed content-height => {
+                                if (root.scroll-pending && self.content-height > 0) {
+                                    self.content-y = self.height - self.content-height;
                                 }
                             }
                             for msg in root.active-chat-messages : HorizontalBox {
