@@ -37,7 +37,7 @@ pub async fn network_task(
         let domain = match server_addr.split(':').next() {
             Some(d) if !d.is_empty() => d.to_string(),
             _ => {
-                controller.handle_ui_event(UiEvent::Disconnected("Invalid server address".into()));
+                controller.handle_ui_event(UiEvent::Fatal("Invalid server address".into()));
                 return;
             }
         };
@@ -50,7 +50,7 @@ pub async fn network_task(
             }
         }
         if added == 0 {
-            controller.handle_ui_event(UiEvent::Disconnected("No trusted root certificates found".into()));
+            controller.handle_ui_event(UiEvent::Fatal("No trusted root certificates found".into()));
             return;
         }
         let config = ClientConfig::builder()
@@ -73,7 +73,7 @@ pub async fn network_task(
         let server_name = match ServerName::try_from(domain.clone()) {
             Ok(n) => n,
             Err(e) => {
-                controller.handle_ui_event(UiEvent::Disconnected(format!("Invalid domain: {e}")));
+                controller.handle_ui_event(UiEvent::Fatal(format!("Invalid domain: {e}")));
                 return;
             }
         };
@@ -97,7 +97,7 @@ pub async fn network_task(
             match crate::settings::load_settings().token.filter(|t| !t.trim().is_empty()) {
                 Some(token) => AuthMethod::Token { token },
                 None => {
-                    controller.handle_ui_event(UiEvent::Disconnected("No token for auto-login".into()));
+                    controller.handle_ui_event(UiEvent::Fatal("No token for auto-login".into()));
                     return;
                 }
             }
@@ -138,7 +138,7 @@ pub async fn network_task(
             let msg: ServerMsg = match decode(line.trim()) {
                 Ok(m) => m,
                 Err(_) => {
-                    controller.handle_ui_event(UiEvent::Disconnected("Malformed handshake frame".into()));
+                    controller.handle_ui_event(UiEvent::Fatal("Malformed handshake frame".into()));
                     return;
                 }
             };
@@ -156,16 +156,17 @@ pub async fn network_task(
                             }
                         }
                         Err(_) => {
-                            controller.handle_ui_event(UiEvent::Disconnected("PoW task failed".into()));
+                            controller.handle_ui_event(UiEvent::Fatal("PoW task failed".into()));
                             return;
                         }
                     }
                 }
-                ServerMsg::AuthOk { user_id, token, expires_at } => {
+                ServerMsg::AuthOk { user_id, token, expires_at, must_change_password } => {
                     controller.handle_ui_event(UiEvent::Server(ServerMsg::AuthOk {
                         user_id,
                         token,
                         expires_at,
+                        must_change_password,
                     }));
                     break;
                 }
@@ -192,7 +193,7 @@ pub async fn network_task(
                             let msg: ServerMsg = match decode(payload) {
                                 Ok(m) => m,
                                 Err(_) => {
-                                    controller.handle_ui_event(UiEvent::Disconnected(
+                                    controller.handle_ui_event(UiEvent::Fatal(
                                         "Malformed frame from server".into(),
                                     ));
                                     break;

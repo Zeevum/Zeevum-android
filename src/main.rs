@@ -13,6 +13,10 @@ include_modules!();
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = MainWindow::new()?;
 
+    if let Some(profile) = settings::profile_label() {
+        app.set_window_title(format!("Rusty Chat [{profile}]").into());
+    }
+
     app.set_friends_list(ModelRc::from(Rc::new(VecModel::default())));
     app.set_active_chat_messages(ModelRc::from(Rc::new(VecModel::default())));
 
@@ -38,6 +42,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let controller = controller.clone();
         app.on_logout(move || {
             controller.handle_logout();
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_change_password(move |old_pass, new_pass| {
+            controller.handle_change_password(old_pass, new_pass);
         });
     }
 
@@ -73,6 +84,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let controller = controller.clone();
         app.on_send_msg(move |text| {
             controller.handle_send_msg(text);
+        });
+    }
+
+    app.on_is_at_bottom(|content_height, view_height, content_y| {
+        controller::is_at_bottom(content_height, view_height, content_y)
+    });
+
+    {
+        let controller = controller.clone();
+        app.on_reconnect(move || {
+            controller.handle_reconnect_now();
         });
     }
 

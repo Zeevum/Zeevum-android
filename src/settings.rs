@@ -10,14 +10,58 @@ pub struct AppSettings {
     pub expires_at: Option<i64>,
 }
 
+/// The command line wins over the environment. A run configuration can drop
+/// the variable without saying anything, and then every profile shares one
+/// file, which is how a second test user finds itself logged in as the first.
+fn profile_from_args(args: &[String]) -> Option<String> {
+    let mut iter = args.iter();
+
+    while let Some(arg) = iter.next() {
+        let candidate = if let Some(value) = arg.strip_prefix("--profile=") {
+            Some(value)
+        } else if arg == "--profile" {
+            iter.next().map(|value| value.as_str())
+        } else {
+            None
+        };
+
+        if let Some(value) = candidate {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn profile_name() -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(profile) = profile_from_args(&args) {
+        return Some(profile);
+    }
+
+    let from_env = std::env::var("ZEEVUM_PROFILE").unwrap_or_default();
+    let from_env = from_env.trim();
+    if from_env.is_empty() {
+        None
+    } else {
+        Some(from_env.to_string())
+    }
+}
+
+/// Shown in the window title, so two running copies can be told apart.
+pub fn profile_label() -> Option<String> {
+    profile_name()
+}
+
 fn get_settings_path() -> PathBuf {
     let mut path = dirs::config_dir()
         .unwrap_or_else(|| std::env::current_dir().expect("no config dir and no cwd"));
-    let profile = std::env::var("ZEEVUM_PROFILE").unwrap_or_default();
-    let filename = if profile.trim().is_empty() {
-        "zeevum_client_settings.json".to_string()
-    } else {
-        format!("zeevum_client_settings_{}.json", profile)
+    let filename = match profile_name() {
+        Some(profile) => format!("zeevum_client_settings_{profile}.json"),
+        None => "zeevum_client_settings.json".to_string(),
     };
     path.push(filename);
     path
@@ -93,6 +137,31 @@ pub fn clear_session() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_profile_comes_from_the_command_line() {
+        let as_args = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| item.to_string())
+                .collect::<Vec<String>>()
+        };
+
+        assert_eq!(
+            super::profile_from_args(&as_args(&["--profile", "b"])).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            super::profile_from_args(&as_args(&["--profile=c"])).as_deref(),
+            Some("c")
+        );
+        assert_eq!(
+            super::profile_from_args(&as_args(&["--profile", "  "])),
+            None,
+            "a blank profile is no profile, it must fall back to the default file"
+        );
+        assert_eq!(super::profile_from_args(&as_args(&[])), None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_settings_file_is_readable_only_by_its_owner() {
