@@ -8,8 +8,9 @@ struct FriendEntry {
 
 struct MessageEntry {
     text: string,
+    time: string,
     is-outgoing: bool,
-    status: int, // 0=отправлено, 1=доставлено(1 галочка), 2=прочитано(2 галочки)
+    status: int,
 }
 
 component FriendItem inherits Rectangle {
@@ -41,14 +42,99 @@ component FriendItem inherits Rectangle {
     }
 }
 
+/// The delivery state, drawn rather than picked out of a font. A font owes
+/// us none of these glyphs, and where it has them they are never the same
+/// weight as each other, so the two marks never looked like a pair.
+component DeliveryMark inherits Rectangle {
+    in-out property <int> status;
+
+    // 0 has not reached the server, 1 is stored on it, 2 has been read by
+    // the peer, 3 was given up on. The second mark appears only once the
+    // peer has read the message, so a second grey one never happens.
+    property <color> tint: root.status == 3 ? #e05555 : root.status == 0 ? #7a8a99 : #5599ff;
+
+    width: root.status == 2 ? 14px : 12px;
+    height: 12px;
+    vertical-stretch: 0;
+    background: transparent;
+
+    if root.status == 0 : Path {
+        width: 12px;
+        height: 12px;
+        viewbox-width: 12;
+        viewbox-height: 12;
+        commands: "M 1.4 6 A 4.6 4.6 0 0 1 10.6 6 A 4.6 4.6 0 0 1 1.4 6 M 6 3.3 L 6 6.2 L 8.1 7.3";
+        stroke: root.tint;
+        stroke-width: 1.3px;
+    }
+
+    if root.status == 1 : Path {
+        width: 12px;
+        height: 12px;
+        viewbox-width: 12;
+        viewbox-height: 12;
+        commands: "M 1.6 6.4 L 4.4 9.2 L 10.4 3.2";
+        stroke: root.tint;
+        stroke-width: 1.6px;
+    }
+
+    if root.status == 2 : Path {
+        width: 14px;
+        height: 12px;
+        viewbox-width: 14;
+        viewbox-height: 12;
+        commands: "M 1.2 6.4 L 3.9 9.1 L 8.3 3.3 M 4.8 6.4 L 7.5 9.1 L 11.9 3.3";
+        stroke: root.tint;
+        stroke-width: 1.6px;
+    }
+
+    if root.status == 3 : Rectangle {
+        width: 12px;
+        height: 12px;
+        background: transparent;
+
+        Path {
+            width: 12px;
+            height: 12px;
+            viewbox-width: 12;
+            viewbox-height: 12;
+            commands: "M 6 1.2 L 11.2 10.8 L 0.8 10.8 Z";
+            stroke: root.tint;
+            stroke-width: 1.3px;
+        }
+
+        Rectangle {
+            x: 5.1px;
+            y: 3.9px;
+            width: 1.8px;
+            height: 4px;
+            background: root.tint;
+        }
+
+        Rectangle {
+            x: 5.1px;
+            y: 8.6px;
+            width: 1.8px;
+            height: 1.8px;
+            border-radius: 0.9px;
+            background: root.tint;
+        }
+    }
+}
+
 component MessageBubble inherits Rectangle {
     in property <MessageEntry> entry;
     out property <length> natural-width: measure.preferred-width + 20px;
+
+    // Narrow enough to still fit the time and both ticks, so a one letter
+    // message does not clip them.
+    out property <length> min-bubble-width: 80px;
 
     background: entry.is-outgoing ? #004e64 : #262633;
     border-radius: 8px;
     horizontal-stretch: 0;
     vertical-stretch: 0;
+    min-width: min-bubble-width;
 
     measure := Text {
         visible: false;
@@ -68,25 +154,53 @@ component MessageBubble inherits Rectangle {
                                                     : TextHorizontalAlignment.left;
         }
 
-        if entry.is-outgoing : Text {
-            text: entry.status == 0 ? "⌛" : entry.status == 1 ? "✓" : "✓✓";
-            color: entry.status == 2 ? #5599ff : #888888;
-            font-size: 12px;
-            horizontal-alignment: TextHorizontalAlignment.right;
+        HorizontalLayout {
+            spacing: 5px;
+            alignment: LayoutAlignment.end;
+
+            Text {
+                text: entry.time;
+                color: #9aa0a6;
+                font-size: 11px;
+                vertical-alignment: TextVerticalAlignment.center;
+            }
+
+            if entry.is-outgoing : DeliveryMark {
+                status: entry.status;
+            }
         }
     }
 }
 
+/// Pulses while the link is being tried. Neither Rectangle nor Path carries
+/// a rotation in Slint 1.18, so this fades instead of turning.
+component Spinner inherits Rectangle {
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background: #9aa0a6;
+
+    property <float> fade: 1.0;
+    init => { self.fade = 0.15; }
+    animate fade { duration: 800ms; iteration-count: -1; }
+
+    opacity: self.fade;
+}
+
 export component MainWindow inherits Window {
-    title: "Rusty Chat";
+    in-out property <string> window-title: "Rusty Chat";
+    title: window-title;
     preferred-width: 800px;
     preferred-height: 600px;
 
-    in-out property <int> current-screen: 0; // 0:Auth, 1:Chat, 2:Settings, 3:Search
+    in-out property <int> current-screen: 0; // 0:Auth, 1:Chat, 2:Settings, 3:Search, 4:Register, 5:Password change
     in-out property <string> server-address: "my.domain.com:6969";
     in-out property <string> login-text: "";
     in-out property <string> password-text: "";
     in-out property <string> confirm-password-text: "";
+    // The temporary password on the forced-change screen. Kept apart from
+    // `password-text`, which is the new one there and drives the strength bar.
+    in-out property <string> old-password-text: "";
     in-out property <string> status-message: "";
     in-out property <[FriendEntry]> friends-list: [];
     in-out property <[MessageEntry]> active-chat-messages: [];
@@ -95,7 +209,13 @@ export component MainWindow inherits Window {
     in-out property <string> input-text: "";
     in-out property <string> search-text: "";
     in-out property <string> search-result: "";
-    in-out property <bool> scroll-pending: false;
+    // True while the newest message is on screen. The list follows only
+    // while it is, so a message arriving during reading cannot move the view.
+    in-out property <bool> chat-at-bottom: true;
+    // What arrived while the reader was away from the bottom.
+    in-out property <int> missed-count: 0;
+    // State of the link: 0 idle, 1 connecting, 2 waiting, 3 online.
+    in-out property <int> link-state: 0;
 
     property <float> pw-bar-width:
         root.password-strength == 4 ? 1.0 :
@@ -212,6 +332,64 @@ export component MainWindow inherits Window {
         }
     }
 
+    // --- ЭКРАН ПРИНУДИТЕЛЬНОЙ СМЕНЫ ПАРОЛЯ (5) ---
+    // The server answers anything but ChangePassword with MustChangePassword,
+    // so there is nothing to click through to. No Back button: there is
+    // nothing to go back to, the session is already open.
+    VerticalBox {
+        padding: 20px;
+        spacing: 15px;
+        visible: root.current-screen == 5;
+
+        Text {
+            text: "Password change required";
+            font-size: 24px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: "Your password was reset by an administrator. Enter the temporary password you were given and choose a new one. All other devices will be signed out.";
+            wrap: TextWrap.word-wrap;
+            color: #d7d7d7;
+            font-size: 13px;
+        }
+
+        LineEdit {
+            input-type: InputType.password;
+            placeholder-text: "Temporary password";
+            text <=> root.old-password-text;
+        }
+
+        LineEdit {
+            input-type: InputType.password;
+            placeholder-text: "New password";
+            text <=> root.password-text;
+            edited => { root.check-password-strength(password-text); }
+        }
+
+        Rectangle {
+            height: 6px; background: #2d2d2d; border-radius: 3px; clip: true;
+            Rectangle {
+                height: 100%; border-radius: 3px;
+                width: parent.width * root.pw-bar-width; background: root.pw-bar-color;
+                animate width { duration: 250ms; easing: ease-in-out; }
+                animate background { duration: 250ms; easing: ease-in-out; }
+            }
+        }
+
+        Text { text: root.password-text != "" ? root.password-strength-text : ""; font-size: 12px; color: #d7d7d7; }
+        LineEdit { input-type: InputType.password; placeholder-text: "Confirm new password"; text <=> root.confirm-password-text; }
+        Text { text: root.passwords-mismatch ? "Passwords do not match" : ""; color: #ff5555; font-size: 12px; }
+        Text { text: status-message; color: #ff5555; wrap: TextWrap.word-wrap; }
+
+        Button {
+            text: "Change password";
+            enabled: root.old-password-text != "" && root.password-text != "" && root.password-text == root.confirm-password-text && root.password-strength >= 2;
+            clicked => { root.change-password(old-password-text, password-text); }
+        }
+    }
+
     // --- ЭКРАН НАСТРОЕК (2) ---
     VerticalBox {
         padding: 20px;
@@ -274,6 +452,32 @@ export component MainWindow inherits Window {
                 Button { text: "🔍 Search User"; clicked => { root.current-screen = 3; } }
                 Button { text: "Disconnect"; clicked => { root.disconnect(); } }
                 Button { text: "Log out"; clicked => { root.logout(); } }
+
+                HorizontalBox {
+                    spacing: 6px;
+                    alignment: start;
+
+                    if root.link-state == 3 : Text {
+                        text: "✓";
+                        color: #55aa55;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+
+                    if root.link-state == 1 || root.link-state == 2 : Spinner { }
+
+                    Text {
+                        text: root.link-state == 3 ? "Online" : root.link-state == 2 ? "No connection" : root.link-state == 1 ? "Connecting..." : "Offline";
+                        color: #9aa0a6;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+
+                    if root.link-state == 2 : Button {
+                        text: "Try now";
+                        clicked => { root.reconnect(); }
+                    }
+                }
             }
         }
 
@@ -299,31 +503,95 @@ export component MainWindow inherits Window {
 
                     Text { text: root.active-peer-login; font-size: 18px; font-weight: 700; }
 
-                    ScrollView {
+                    Rectangle {
                         vertical-stretch: 1;
-                        chat-list := ListView {
-                            changed content-height => {
-                                if (root.scroll-pending && self.content-height > 0) {
+
+                        ScrollView {
+                            width: parent.width;
+                            height: parent.height;
+                            chat-list := ListView {
+                                // A ListView is a ScrollView of its own, so
+                                // this is what scrolls. The wrapper around it
+                                // holds exactly as much as it is given and
+                                // never moves.
+                                property <int> pin-seen <=> root.pin-requests;
+                                changed pin-seen => {
                                     self.content-y = self.height - self.content-height;
+                                    root.chat-at-bottom = true;
+                                    root.missed-count = 0;
+                                }
+
+                                // The reader's own position. It is sampled as the view moves,
+                                // which is before the model grows, so a new message does not
+                                // count as having scrolled up.
+                                changed content-y => {
+                                    root.chat-at-bottom = root.is-at-bottom(self.content-height, self.height, self.content-y);
+                                    if (root.chat-at-bottom) {
+                                        root.missed-count = 0;
+                                    }
+                                }
+
+                                // The height is not final the moment the model
+                                // changes: rows are laid out after it, and a
+                                // taller row than the one allowed for leaves
+                                // the newest message below the fold. Pin again
+                                // whenever it moves, and again from the timer
+                                // in `end_at_newest`, which covers the cases
+                                // where it settles without telling us.
+                                changed content-height => {
+                                    if (root.chat-at-bottom && self.content-height > 0) {
+                                        self.content-y = self.height - self.content-height;
+                                    }
+                                }
+                                for msg in root.active-chat-messages : HorizontalBox {
+                                    spacing: 0px;
+                                    padding: 5px;
+
+                                    if msg.is-outgoing : Rectangle {
+                                        horizontal-stretch: 1;
+                                        min-width: 0px;
+                                    }
+
+                                    bubble := MessageBubble {
+                                        entry: msg;
+                                        width: max(min(bubble.natural-width, chat-list.width * 70%), bubble.min-bubble-width);
+                                    }
+
+                                    if !msg.is-outgoing : Rectangle {
+                                        horizontal-stretch: 1;
+                                        min-width: 0px;
+                                    }
                                 }
                             }
-                            for msg in root.active-chat-messages : HorizontalBox {
-                                spacing: 0px;
-                                padding: 5px;
+                    }
 
-                                if msg.is-outgoing : Rectangle {
-                                    horizontal-stretch: 1;
-                                    min-width: 0px;
-                                }
+                        // Anchored to the chat area, not to the panel: the
+                        // input row below it belongs to neither.
+                        if root.missed-count > 0 : Rectangle {
+                            y: parent.height - self.height - 12px;
+                            x: parent.width - self.width - 12px;
+                            height: 28px;
+                            width: pill-text.preferred-width + 24px;
+                            border-radius: 14px;
+                            background: #2b6cb0;
 
-                                bubble := MessageBubble {
-                                    entry: msg;
-                                    width: min(bubble.natural-width, chat-list.width * 70%);
-                                }
+                            pill-text := Text {
+                                x: 12px;
+                                y: 0px;
+                                width: parent.width - 24px;
+                                height: parent.height;
+                                text: "↓ " + root.missed-count;
+                                color: #ffffff;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
 
-                                if !msg.is-outgoing : Rectangle {
-                                    horizontal-stretch: 1;
-                                    min-width: 0px;
+                            TouchArea {
+                                width: parent.width;
+                                height: parent.height;
+                                clicked => {
+                                    root.pin-requests += 1;
                                 }
                             }
                         }
@@ -351,7 +619,18 @@ export component MainWindow inherits Window {
     callback logout();
     callback save-settings(string);
     callback check-password-strength(string);
+callback change-password(string, string);
     callback search-user(string);
     callback open-chat(int, string);
     callback send-msg(string);
+    // Asked by the corner when the reader will not wait out the timer.
+    callback reconnect();
+    // Bumped whenever the reader is to be taken to the newest message:
+    // sending, opening a chat, messages arriving while already at the
+    // bottom. A request rather than a command, because the list is nested
+    // inside a conditional and cannot be reached from here.
+    in-out property <int> pin-requests: 0;
+    // Geometry of the message list, answered from Rust so the decision
+    // can be tested without a window.
+    callback is-at-bottom(length, length, length) -> bool;
 }
