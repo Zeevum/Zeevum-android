@@ -26,6 +26,7 @@ pub async fn network_task(
     server_addr: String,
     login: String,
     password: String,
+    invite: Option<String>,
     is_register: bool,
     mut cmd_rx: mpsc::UnboundedReceiver<ClientMsg>,
 ) {
@@ -102,7 +103,11 @@ pub async fn network_task(
                 }
             }
         } else if is_register {
-            AuthMethod::Register { login: login.clone(), password: password.clone() }
+            AuthMethod::Register {
+                login: login.clone(),
+                password: password.clone(),
+                invite_code: invite.clone(),
+            }
         } else {
             AuthMethod::Login { login: login.clone(), password: password.clone() }
         };

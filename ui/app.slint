@@ -198,6 +198,9 @@ export component MainWindow inherits Window {
     in-out property <string> login-text: "";
     in-out property <string> password-text: "";
     in-out property <string> confirm-password-text: "";
+    // The registration screen offers it; whether it is needed only the
+    // server knows, so the field is always there and never required.
+    in-out property <string> invite-text: "";
     // The temporary password on the forced-change screen. Kept apart from
     // `password-text`, which is the new one there and drives the strength bar.
     in-out property <string> old-password-text: "";
@@ -284,7 +287,7 @@ export component MainWindow inherits Window {
             Button {
                 text: "Login";
                 horizontal-stretch: 1;
-                clicked => { root.connect(server-address, login-text, password-text, false); }
+                clicked => { root.connect(server-address, login-text, password-text, false, ""); }
             }
         }
     }
@@ -303,6 +306,7 @@ export component MainWindow inherits Window {
         }
 
         LineEdit { placeholder-text: "Login (3-32 chars, a-z, 0-9, _)"; text <=> login-text; }
+        LineEdit { placeholder-text: "Invite code (if required)"; text <=> invite-text; }
         LineEdit { input-type: InputType.password; placeholder-text: "Password"; text <=> password-text; edited => { root.check-password-strength(password-text); } }
 
         Rectangle {
@@ -327,7 +331,7 @@ export component MainWindow inherits Window {
                 text: "Register";
                 horizontal-stretch: 1;
                 enabled: root.password-text != "" && root.password-text == root.confirm-password-text && root.password-strength >= 2;
-                clicked => { root.connect(server-address, login-text, password-text, true); }
+                clicked => { root.connect(server-address, login-text, password-text, true, invite-text); }
             }
         }
     }
@@ -614,7 +618,7 @@ export component MainWindow inherits Window {
         }
     }
 
-    callback connect(string, string, string, bool);
+    callback connect(string, string, string, bool, string);
     callback disconnect();
     callback logout();
     callback save-settings(string);

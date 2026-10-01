@@ -26,8 +26,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     {
         let controller = controller.clone();
-        app.on_connect(move |addr, login, pass, is_reg| {
-            controller.handle_connect(addr, login, pass, is_reg);
+        app.on_connect(move |addr, login, pass, is_reg, invite| {
+            controller.handle_connect(addr, login, pass, is_reg, invite);
         });
     }
 

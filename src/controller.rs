@@ -232,10 +232,16 @@ impl AppController {
         login: SharedString,
         password: SharedString,
         is_register: bool,
+        invite: SharedString,
     ) {
         let addr_str: String = addr.to_string();
         let login_str: String = login.to_string();
         let pass_str: String = password.to_string();
+        let invite_str = invite.to_string();
+        let invite_opt = match invite_str.trim() {
+            "" => None,
+            code => Some(code.to_string()),
+        };
 
         {
             let mut state_lock = self.state.lock().unwrap();
@@ -256,12 +262,19 @@ impl AppController {
             ui.set_status_message("Connecting...".into());
         }
 
-        self.spawn_network_task(addr_str, login_str, pass_str, is_register);
+        self.spawn_network_task(addr_str, login_str, pass_str, invite_opt, is_register);
     }
 
     /// One attempt at the link, whoever asked for it. The first one is not a
     /// retry, so it is not made to wait.
-    fn spawn_network_task(&self, addr: String, login: String, password: String, is_register: bool) {
+    fn spawn_network_task(
+        &self,
+        addr: String,
+        login: String,
+        password: String,
+        invite: Option<String>,
+        is_register: bool,
+    ) {
         let in_flight = self.sender_slot.lock().unwrap().is_some();
 
         {
@@ -293,7 +306,16 @@ impl AppController {
         // wake there. Outside the lock above, so that a failure cannot
         // poison it.
         self.runtime.spawn(async move {
-            network_task(controller_clone, addr, login, password, is_register, rx_cmd).await;
+            network_task(
+                controller_clone,
+                addr,
+                login,
+                password,
+                invite,
+                is_register,
+                rx_cmd,
+            )
+            .await;
         });
     }
 
@@ -326,6 +348,7 @@ impl AppController {
             addr,
             settings.login.unwrap_or_default(),
             String::new(),
+            None,
             false,
         );
     }
@@ -413,6 +436,7 @@ impl AppController {
                 settings.login.unwrap_or_default().into(),
                 "".into(),
                 false,
+                "".into(),
             );
         }
     }

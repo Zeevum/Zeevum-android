@@ -6316,7 +6316,7 @@ dependencies = [
 [[package]]
 name = "zeevum-protocol"
 version = "0.1.1"
-source = "git+https://github.com/Zeevum/zeevum-protocol?branch=dev#033562852eaa1e6a97c673224311f494c80ebdd6"
+source = "git+https://github.com/Zeevum/zeevum-protocol?branch=dev#6f0bd0684c50f764066f8b5dd21711b11c1cd282"
 dependencies = [
  "rand",
  "serde",
