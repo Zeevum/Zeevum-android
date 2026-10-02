@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{split, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{split, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -12,7 +12,7 @@ use rustls_native_certs::load_native_certs;
 use rustls_pki_types::ServerName;
 
 use zeevum_protocol::{
-    decode, encode, pow, AuthMethod, ClientMsg, ConvId, ServerMsg, MAX_LINE_BYTES, PROTOCOL_VERSION,
+    decode, encode, pow, read_frame, AuthMethod, ClientMsg, ConvId, ServerMsg, PROTOCOL_VERSION,
 };
 
 use crate::controller::AppController;
@@ -270,39 +270,6 @@ pub async fn network_task(
 
     let mut guard = sender_slot.lock().unwrap();
     *guard = None;
-}
-
-async fn read_frame<S>(reader: &mut S) -> std::io::Result<String>
-where
-    S: AsyncBufReadExt + Unpin,
-{
-    let mut out: Vec<u8> = Vec::with_capacity(512);
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return Ok(String::from_utf8_lossy(&out).into_owned());
-        }
-        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-            out.extend_from_slice(&available[..=pos]);
-            reader.consume(pos + 1);
-            if out.len() > MAX_LINE_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "frame exceeds MAX_LINE_BYTES",
-                ));
-            }
-            return Ok(String::from_utf8_lossy(&out).into_owned());
-        }
-        out.extend_from_slice(available);
-        let used = available.len();
-        reader.consume(used);
-        if out.len() > MAX_LINE_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "frame exceeds MAX_LINE_BYTES",
-            ));
-        }
-    }
 }
 
 async fn write_frame<W>(writer: &mut W, frame: &str) -> std::io::Result<()>

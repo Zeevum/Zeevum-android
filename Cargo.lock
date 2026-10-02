@@ -6316,12 +6316,13 @@ dependencies = [
 [[package]]
 name = "zeevum-protocol"
 version = "0.1.1"
-source = "git+https://github.com/Zeevum/zeevum-protocol?branch=dev#6f0bd0684c50f764066f8b5dd21711b11c1cd282"
+source = "git+https://github.com/Zeevum/zeevum-protocol?branch=dev#f97310975be910d3aab228600b9f9ca30686b806"
 dependencies = [
  "rand",
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
  "uuid",
 ]
 
