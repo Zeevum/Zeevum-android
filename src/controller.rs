@@ -11,19 +11,47 @@ use uuid::Uuid;
 use crate::network::network_task;
 use crate::settings;
 use crate::types::{ChatMessage, CmdSender, DeliveryStatus, PendingSend, UiEvent};
-use crate::{FriendEntry, MainWindow, MessageEntry};
+use crate::{ConvEntry, FriendCheckEntry, MainWindow, MemberEntry, MessageEntry, RequestEntry};
 
-use zeevum_protocol::{ClientMsg, ErrorCode, ServerMsg, UnreadEntry, UserBrief, MAX_MESSAGE_LEN};
+use std::collections::HashSet;
+use zeevum_protocol::{
+    AdminRights, ChatEntry, ChatKind, ClientMsg, ErrorCode, GroupMember, MemberRole, ServerMsg,
+    UserBrief, MAX_MESSAGE_LEN,
+};
 
 #[derive(Clone)]
 pub struct AppController {
     pub ui: Weak<MainWindow>,
     pub sender_slot: CmdSender,
     state: Arc<Mutex<ChatState>>,
+    /// Friends picked for the group being created. UI-transient, it is not
+    /// part of the conversation state.
+    group_selection: Arc<Mutex<HashSet<i64>>>,
     link: Arc<Mutex<Link>>,
     /// Held because attempts are started from the link thread, which is not
     /// inside the runtime and has no reactor of its own.
     runtime: Handle,
+}
+
+/// One row of the conversation list: what it is called, how much of it is
+/// unread, and what its last message said. A group also carries its members
+/// with roles and rights, the whole truth of one GroupInfo frame.
+pub struct Conversation {
+    pub kind: ChatKind,
+    pub unread: usize,
+    /// The newest message, the row's second line.
+    pub last: Option<LastMsg>,
+    /// Groups only, empty for a private chat. Replaced wholesale by every
+    /// GroupInfo, never patched field by field.
+    pub members: Vec<GroupMember>,
+}
+
+/// What the list row shows of the newest message.
+#[allow(dead_code)] // rendered by the conversation-list UI
+pub struct LastMsg {
+    pub sender_user_id: i64,
+    pub timestamp: i64,
+    pub text: String,
 }
 
 pub struct ChatState {
@@ -47,13 +75,29 @@ pub struct ChatState {
     /// Messages by conversation, not by peer.
     pub messages: HashMap<Uuid, Vec<ChatMessage>>,
     pub incoming_reqs: Vec<UserBrief>,
-    /// Lives in the state, not in the UI model. The friend list model is
-    /// rebuilt from that state, so a counter kept in a widget would be lost
-    /// on every rebuild.
-    pub unread: HashMap<i64, usize>,
+    /// Lives in the state, not in the UI model. The list model is rebuilt
+    /// from that state, so a counter kept in a widget would be lost on every
+    /// rebuild.
+    pub conversations: HashMap<Uuid, Conversation>,
     /// Sent, not yet acknowledged, by message id. Survives a reconnect, the
     /// retry thread keeps its own clock and asks this map what is due.
     pub pending: HashMap<Uuid, PendingSend>,
+    /// The group the owner is leaving without transferring, set when the
+    /// LeaveGroup frame goes out and spent by the RemovedFromGroup that
+    /// answers it: that row stays in the list, marked, instead of dying.
+    pub keep_after_leave: Option<Uuid>,
+}
+
+impl ChatState {
+    /// The friend list shows a badge per friend, the count lives on their
+    /// private conversation, so the peer-to-conversation map is consulted.
+    #[cfg(test)] // the conversation list took the badge over in 6.1d
+    pub fn unread_for_friend(&self, peer: i64) -> usize {
+        self.conv
+            .get(&peer)
+            .and_then(|conv_id| self.conversations.get(conv_id))
+            .map_or(0, |conv| conv.unread)
+    }
 }
 
 /// Who owns the attempts to be connected. Kept apart from `ChatState`, it
@@ -167,6 +211,7 @@ impl AppController {
         let controller = Self {
             ui,
             sender_slot: Arc::new(Mutex::new(None)),
+            group_selection: Arc::new(Mutex::new(HashSet::new())),
             state: Arc::new(Mutex::new(ChatState {
                 my_user_id: 0,
                 active_peer_id: None,
@@ -178,8 +223,9 @@ impl AppController {
                 friends: Vec::new(),
                 messages: HashMap::new(),
                 incoming_reqs: Vec::new(),
-                unread: HashMap::new(),
+                conversations: HashMap::new(),
                 pending: HashMap::new(),
+                keep_after_leave: None,
             })),
             link: Arc::new(Mutex::new(Link::default())),
             runtime: Handle::current(),
@@ -389,6 +435,7 @@ impl AppController {
         state_lock.active_peer_login.clear();
         state_lock.active_conv = None;
         state_lock.conv.clear();
+        state_lock.conversations.clear();
         state_lock.my_user_id = 0;
         state_lock.friends.clear();
 
@@ -400,10 +447,17 @@ impl AppController {
                 ui.set_current_screen(0);
                 ui.set_active_peer_id(-1);
                 ui.set_active_peer_login("".into());
+                ui.set_dialog_open(false);
+                ui.set_active_conv_id("".into());
+                ui.set_active_title("".into());
             }
         })
         .ok();
-        sync_friends(&self.ui, state_lock);
+        {
+            let selection = self.group_selection.lock().unwrap().clone();
+            sync_contacts(&self.ui, state_lock, &selection);
+        }
+        sync_conversations(&self.ui, state_lock);
         sync_messages(&self.ui, state_lock);
         self.set_link_status();
     }
@@ -442,7 +496,16 @@ impl AppController {
     }
 
     pub fn handle_send_msg(&self, text: SharedString) {
-        let text_str = text.to_string();
+        // Telegram's rule: the ends are nobody's, the middle is the
+        // author's. What is sent and rendered is the trimmed text; the
+        // spaces between words survive untouched.
+        let text_str = text.trim().to_string();
+
+        // Whitespace only is not a message. The field's guard should have
+        // caught it already; this is the belt to that pair of braces.
+        if text_str.is_empty() {
+            return;
+        }
 
         if text_str.len() > MAX_MESSAGE_LEN {
             let ui_weak = self.ui.clone();
@@ -513,11 +576,28 @@ impl AppController {
         state_lock.active_peer_id = Some(peer);
         state_lock.active_peer_login = login.to_string();
         state_lock.active_conv = state_lock.conv.get(&peer).copied();
-        state_lock.unread.insert(peer, 0);
+        // Opening the dialog reads the conversation; its badge is spent.
+        let conv_id = state_lock.conv.get(&peer).copied();
+        if let Some(conv_id) = conv_id {
+            if let Some(conv) = state_lock.conversations.get_mut(&conv_id) {
+                conv.unread = 0;
+            }
+        }
 
         if let Some(ui) = self.ui.upgrade() {
             ui.set_active_peer_id(peer_user_id);
-            ui.set_active_peer_login(login);
+            ui.set_active_peer_login(login.clone());
+            ui.set_active_title(login);
+            ui.set_active_is_group(false);
+            ui.set_active_members_label("".into());
+            ui.set_active_conv_id(
+                state_lock
+                    .active_conv
+                    .map(|c| c.to_string())
+                    .unwrap_or_default()
+                    .into(),
+            );
+            ui.set_dialog_open(true);
             // Opening a chat starts at the newest message, even if the one
             // open before was being read from the middle.
             end_at_newest(&ui);
@@ -541,7 +621,7 @@ impl AppController {
             }
         }
 
-        sync_friends(&ui_weak, &state_lock);
+        sync_conversations(&ui_weak, &state_lock);
     }
 
     pub fn handle_search_user(&self, login: SharedString) {
@@ -549,6 +629,398 @@ impl AppController {
         let guard = self.sender_slot.lock().unwrap();
         if let Some(tx) = guard.as_ref() {
             let _ = tx.send(ClientMsg::SearchUser { login: login_str });
+        }
+    }
+
+    /// Screen 1: a row of the conversation list. A private chat opens the
+    /// way it always did, a group opens on the conversation itself, and a
+    /// left-but-owned group opens the panel, there is nothing to read.
+    pub fn handle_open_conversation(&self, conv_id: SharedString) {
+        let Ok(conv) = Uuid::parse_str(conv_id.as_ref()) else {
+            return;
+        };
+        let mut state_lock = self.state.lock().unwrap();
+        let Some(conversation) = state_lock.conversations.get(&conv) else {
+            return;
+        };
+
+        match conversation.kind.clone() {
+            ChatKind::Private { peer } => {
+                // A conversation born of a message has no login yet; the
+                // friend list knows the name.
+                let login = if peer.login.is_empty() {
+                    state_lock
+                        .friends
+                        .iter()
+                        .find(|f| f.user_id == peer.user_id)
+                        .map(|f| f.login.clone())
+                        .unwrap_or_default()
+                } else {
+                    peer.login.clone()
+                };
+                drop(state_lock);
+                self.handle_open_chat(peer.user_id as i32, login.into());
+            }
+            ChatKind::Group { you_left, .. } => {
+                let title = match &state_lock.conversations[&conv].kind {
+                    ChatKind::Group { title, .. } => title.clone(),
+                    ChatKind::Private { .. } => unreachable!(),
+                };
+                let members = state_lock.conversations[&conv].members.len();
+
+                state_lock.active_conv = Some(conv);
+                state_lock.active_peer_id = None;
+                state_lock.active_peer_login.clear();
+                if let Some(conversation) = state_lock.conversations.get_mut(&conv) {
+                    conversation.unread = 0;
+                }
+
+                if you_left {
+                    // The owner kept the ownership but is not a member:
+                    // nothing to read, the panel offers the two ways this
+                    // can go.
+                    if let Some(ui) = self.ui.upgrade() {
+                        ui.set_dialog_open(false);
+                        ui.set_active_conv_id("".into());
+                    }
+                    self.show_group_panel(&mut state_lock);
+                    return;
+                }
+
+                {
+                    let guard = self.sender_slot.lock().unwrap();
+                    if let Some(tx) = guard.as_ref() {
+                        let _ = tx.send(ClientMsg::HistoryReq { conv_id: conv });
+                    }
+                }
+
+                if let Some(ui) = self.ui.upgrade() {
+                    ui.set_active_conv_id(conv.to_string().into());
+                    ui.set_active_is_group(true);
+                    ui.set_active_title(title.into());
+                    ui.set_active_members_label(format!("{members} members").into());
+                    ui.set_active_peer_id(-1);
+                    ui.set_active_peer_login("".into());
+                    ui.set_dialog_open(true);
+                    end_at_newest(&ui);
+                    sync_messages_now(&ui, &state_lock);
+                }
+                sync_conversations(&self.ui, &state_lock);
+            }
+        }
+    }
+
+    /// Screen 6.
+    pub fn handle_show_contacts(&self) {
+        let state_lock = self.state.lock().unwrap();
+        let selection = self.group_selection.lock().unwrap().clone();
+        sync_contacts(&self.ui, &state_lock, &selection);
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_contacts_create_mode(false);
+            ui.set_group_name_text("".into());
+            ui.set_current_screen(6);
+        }
+    }
+
+    pub fn handle_contacts_back(&self) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_current_screen(1);
+        }
+    }
+
+    /// A friend row on the contacts screen.
+    pub fn handle_open_friend_chat(&self, user_id: i32) {
+        let login = {
+            let state_lock = self.state.lock().unwrap();
+            state_lock
+                .friends
+                .iter()
+                .find(|f| f.user_id == user_id as i64)
+                .map(|f| f.login.clone())
+                .unwrap_or_default()
+        };
+        self.handle_open_chat(user_id, login.into());
+    }
+
+    pub fn handle_accept_request(&self, user_id: i32) {
+        let guard = self.sender_slot.lock().unwrap();
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(ClientMsg::AcceptFriend {
+                target_user_id: user_id as i64,
+            });
+        }
+    }
+
+    /// One checkbox in the group-creation list.
+    pub fn handle_toggle_friend(&self, user_id: i32) {
+        let mut selection = self.group_selection.lock().unwrap();
+        if !selection.insert(user_id as i64) {
+            selection.remove(&(user_id as i64));
+        }
+        let sel = selection.clone();
+        drop(selection);
+        let state_lock = self.state.lock().unwrap();
+        sync_contacts(&self.ui, &state_lock, &sel);
+    }
+
+    pub fn handle_create_group(&self, title: SharedString) {
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            if let Some(ui) = self.ui.upgrade() {
+                ui.set_search_result("Name the group first.".into());
+            }
+            return;
+        }
+
+        let members = {
+            let state_lock = self.state.lock().unwrap();
+            let selection = self.group_selection.lock().unwrap();
+            state_lock
+                .friends
+                .iter()
+                .filter(|f| selection.contains(&f.user_id))
+                .map(|f| f.user_id)
+                .collect::<Vec<_>>()
+        };
+
+        {
+            let guard = self.sender_slot.lock().unwrap();
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(ClientMsg::CreateGroup { title, members });
+            }
+        }
+
+        self.group_selection.lock().unwrap().clear();
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_contacts_create_mode(false);
+            ui.set_group_name_text("".into());
+            ui.set_current_screen(1);
+        }
+        // The group appears in the list when GroupInfo arrives.
+    }
+
+    /// Screen 7, from the header of an open group.
+    pub fn handle_open_group_panel(&self) {
+        let mut state_lock = self.state.lock().unwrap();
+        self.show_group_panel(&mut state_lock);
+    }
+
+    /// Fills the panel from the open conversation and switches to it.
+    /// Called on the UI thread only.
+    fn show_group_panel(&self, state_lock: &mut ChatState) {
+        if let Some(ui) = self.ui.upgrade() {
+            if let Some(data) = panel_data(state_lock) {
+                apply_panel(&ui, &data);
+            }
+            ui.set_group_selected_member(-1);
+            ui.set_group_editor_visible(false);
+            ui.set_group_add_name("".into());
+            ui.set_show_leave_confirm(false);
+            ui.set_current_screen(7);
+        }
+    }
+
+    pub fn handle_group_back(&self) {
+        let mut state_lock = self.state.lock().unwrap();
+        let you_left = state_lock
+            .active_conv
+            .and_then(|conv| state_lock.conversations.get(&conv))
+            .map(|conv| matches!(&conv.kind, ChatKind::Group { you_left: true, .. }))
+            .unwrap_or(false);
+        if you_left {
+            // The panel was the whole visit: nothing was open behind it.
+            state_lock.active_conv = None;
+            if let Some(ui) = self.ui.upgrade() {
+                ui.set_dialog_open(false);
+                ui.set_active_conv_id("".into());
+                ui.set_active_title("".into());
+            }
+        }
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_current_screen(1);
+        }
+    }
+
+    pub fn handle_group_rename(&self, title: SharedString) {
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            return;
+        }
+        let state_lock = self.state.lock().unwrap();
+        let Some(conv) = state_lock.active_conv else {
+            return;
+        };
+        let guard = self.sender_slot.lock().unwrap();
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(ClientMsg::RenameGroup {
+                conv_id: conv,
+                title,
+            });
+        }
+    }
+
+    pub fn handle_group_add_member(&self, login: SharedString) {
+        let state_lock = self.state.lock().unwrap();
+        let Some(conv) = state_lock.active_conv else {
+            return;
+        };
+        let Some(conversation) = state_lock.conversations.get(&conv) else {
+            return;
+        };
+        // Names, not positions: the combo hands over the login it showed.
+        let member_ids: HashSet<i64> = conversation
+            .members
+            .iter()
+            .map(|m| m.user.user_id)
+            .collect();
+        let Some(target) = state_lock
+            .friends
+            .iter()
+            .find(|f| !member_ids.contains(&f.user_id) && f.login == login.as_str())
+            .map(|f| f.user_id)
+        else {
+            return;
+        };
+        let guard = self.sender_slot.lock().unwrap();
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(ClientMsg::GroupAddMember {
+                conv_id: conv,
+                target_user_id: target,
+            });
+        }
+    }
+
+    pub fn handle_group_remove_member(&self, user_id: i32) {
+        let state_lock = self.state.lock().unwrap();
+        let Some(conv) = state_lock.active_conv else {
+            return;
+        };
+        let guard = self.sender_slot.lock().unwrap();
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(ClientMsg::GroupRemoveMember {
+                conv_id: conv,
+                target_user_id: user_id as i64,
+            });
+        }
+    }
+
+    /// Puts the selected member's rights into the editor, or hides the
+    /// editor when the member is not the caller's to reshape.
+    pub fn handle_group_select_member(&self, user_id: i32) {
+        let state_lock = self.state.lock().unwrap();
+        let Some(conv) = state_lock.active_conv else {
+            return;
+        };
+        let Some(conversation) = state_lock.conversations.get(&conv) else {
+            return;
+        };
+        let Some(mine) = conversation
+            .members
+            .iter()
+            .find(|m| m.user.user_id == state_lock.my_user_id)
+        else {
+            return;
+        };
+        let Some(target) = conversation
+            .members
+            .iter()
+            .find(|m| m.user.user_id == user_id as i64)
+        else {
+            return;
+        };
+
+        let im_owner = mine.role == MemberRole::Owner;
+        let can_edit = target.role != MemberRole::Owner
+            && (im_owner || (mine.rights.add_admins && target.role == MemberRole::Member));
+
+        if let Some(ui) = self.ui.upgrade() {
+            ui.set_group_selected_member(user_id);
+            ui.set_group_editor_visible(can_edit);
+            ui.set_edit_change_info(target.rights.change_info);
+            ui.set_edit_invite_users(target.rights.invite_users);
+            ui.set_edit_ban_users(target.rights.ban_users);
+            ui.set_edit_add_admins(target.rights.add_admins);
+        }
+    }
+
+    pub fn handle_group_apply_rights(
+        &self,
+        user_id: i32,
+        change_info: bool,
+        invite_users: bool,
+        ban_users: bool,
+        add_admins: bool,
+    ) {
+        let state_lock = self.state.lock().unwrap();
+        let Some(conv) = state_lock.active_conv else {
+            return;
+        };
+        let guard = self.sender_slot.lock().unwrap();
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(ClientMsg::GroupSetAdmin {
+                conv_id: conv,
+                target_user_id: user_id as i64,
+                rights: AdminRights {
+                    change_info,
+                    invite_users,
+                    ban_users,
+                    add_admins,
+                },
+            });
+        }
+    }
+
+    pub fn handle_group_leave(&self, transfer: bool) {
+        let mut state_lock = self.state.lock().unwrap();
+        let Some(conv) = state_lock.active_conv else {
+            return;
+        };
+        // The owner leaving without a transfer keeps the ownership, and the
+        // list keeps the group, marked. The flag tells RemovedFromGroup,
+        // which arrives without saying why, which of the two this was.
+        if !transfer {
+            let im_owner = state_lock
+                .conversations
+                .get(&conv)
+                .map(|c| {
+                    c.members.iter().any(|m| {
+                        m.user.user_id == state_lock.my_user_id && m.role == MemberRole::Owner
+                    })
+                })
+                .unwrap_or(false);
+            if im_owner {
+                state_lock.keep_after_leave = Some(conv);
+            }
+        }
+        let guard = self.sender_slot.lock().unwrap();
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(ClientMsg::LeaveGroup {
+                conv_id: conv,
+                transfer_ownership: transfer,
+            });
+        }
+        // RemovedFromGroup closes this; GroupInfo updates everyone else.
+    }
+
+    pub fn handle_group_delete(&self) {
+        let state_lock = self.state.lock().unwrap();
+        let Some(conv) = state_lock.active_conv else {
+            return;
+        };
+        let guard = self.sender_slot.lock().unwrap();
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(ClientMsg::DeleteGroup { conv_id: conv });
+        }
+    }
+
+    pub fn handle_group_join(&self) {
+        let state_lock = self.state.lock().unwrap();
+        let Some(conv) = state_lock.active_conv else {
+            return;
+        };
+        let guard = self.sender_slot.lock().unwrap();
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(ClientMsg::JoinGroup { conv_id: conv });
         }
     }
 
@@ -574,7 +1046,7 @@ impl AppController {
             state_lock.conv.clear();
             state_lock.my_user_id = 0;
             state_lock.messages.clear();
-            state_lock.unread.clear();
+            state_lock.conversations.clear();
             // Nobody is going to acknowledge these, and there is nobody left
             // to show them to.
             state_lock.pending.clear();
@@ -584,6 +1056,9 @@ impl AppController {
             ui.set_current_screen(0);
             ui.set_active_peer_id(-1);
             ui.set_active_peer_login("".into());
+            ui.set_dialog_open(false);
+            ui.set_active_conv_id("".into());
+            ui.set_active_title("".into());
             sync_messages_now(&ui, &state_lock);
         }
     }
@@ -816,6 +1291,21 @@ impl AppController {
                             })
                             .ok();
                         }
+                        // Group administration: a right was missing, the
+                        // member is already in, or the title did not pass.
+                        // The conversation and the screen stay as they are,
+                        // the line says what gave.
+                        ErrorCode::NotPermitted
+                        | ErrorCode::AlreadyMember
+                        | ErrorCode::TitleTooLong => {
+                            let text = code.to_string();
+                            slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_weak.upgrade() {
+                                    ui.set_status_message(text.into());
+                                }
+                            })
+                            .ok();
+                        }
                         // While connected these three can only be about a
                         // password change: the temporary password did not
                         // match, the new one is too weak, or some other frame
@@ -850,16 +1340,23 @@ impl AppController {
                 }
 
                 ServerMsg::FriendList { entries } => {
-                    state_lock.unread.clear();
                     state_lock.friends = entries;
-                    sync_friends(&ui_weak, &state_lock);
+                    {
+                        // A selection that names someone who is no friend
+                        // anymore would count a stranger into a new group.
+                        let mut selection = self.group_selection.lock().unwrap();
+                        selection.retain(|id| state_lock.friends.iter().any(|f| f.user_id == *id));
+                    }
+                    let selection = self.group_selection.lock().unwrap().clone();
+                    sync_contacts(&ui_weak, &state_lock, &selection);
                 }
                 ServerMsg::PendingReqs { entries } => {
                     let names: Vec<String> = entries.iter().map(|u| u.login.clone()).collect();
                     state_lock.incoming_reqs = entries;
                     if !names.is_empty() {
+                        let weak = ui_weak.clone();
                         slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui_weak.upgrade() {
+                            if let Some(ui) = weak.upgrade() {
                                 ui.set_search_result(
                                     format!("Pending friend requests from: {}", names.join(", "))
                                         .into(),
@@ -868,12 +1365,15 @@ impl AppController {
                         })
                         .ok();
                     }
+                    let selection = self.group_selection.lock().unwrap().clone();
+                    sync_contacts(&ui_weak, &state_lock, &selection);
                 }
                 ServerMsg::IncomingReq { from } => {
                     let login = from.login.clone();
                     state_lock.incoming_reqs.push(from);
+                    let weak = ui_weak.clone();
                     slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_weak.upgrade() {
+                        if let Some(ui) = weak.upgrade() {
                             ui.set_search_result(
                                 format!(
                                     "Incoming request from: {}. Search for '{}' to accept!",
@@ -884,17 +1384,90 @@ impl AppController {
                         }
                     })
                     .ok();
+                    let selection = self.group_selection.lock().unwrap().clone();
+                    sync_contacts(&ui_weak, &state_lock, &selection);
                 }
                 ServerMsg::FriendAdded { user } => {
                     let chat_id = user.user_id;
                     if !state_lock.friends.iter().any(|f| f.user_id == chat_id) {
                         state_lock.friends.push(user);
-                        sync_friends(&ui_weak, &state_lock);
+                        let selection = self.group_selection.lock().unwrap().clone();
+                        sync_contacts(&ui_weak, &state_lock, &selection);
                     }
                 }
-                ServerMsg::UnreadSummary { entries } => {
-                    state_lock.unread = unread_from_summary(entries);
-                    sync_friends(&ui_weak, &state_lock);
+                ServerMsg::ChatList { entries } => {
+                    state_lock.conversations = conversations_from_entries(&entries);
+                    // A private chat also fills the peer-to-conversation
+                    // cache, so opening a friend's dialog never waits for
+                    // ResolveDm.
+                    for entry in &entries {
+                        if let ChatKind::Private { peer } = &entry.kind {
+                            state_lock.conv.insert(peer.user_id, entry.conv_id);
+                        }
+                    }
+                    let selection = self.group_selection.lock().unwrap().clone();
+                    sync_contacts(&ui_weak, &state_lock, &selection);
+                    sync_conversations(&ui_weak, &state_lock);
+                }
+                ServerMsg::GroupInfo {
+                    conv_id,
+                    title,
+                    members,
+                } => {
+                    // The whole truth about a group, one frame. The
+                    // conversation may not be known yet: being added to a
+                    // group is announced exactly this way.
+                    let conv =
+                        state_lock
+                            .conversations
+                            .entry(conv_id)
+                            .or_insert_with(|| Conversation {
+                                kind: ChatKind::Group {
+                                    title: String::new(),
+                                    you_left: false,
+                                },
+                                unread: 0,
+                                last: None,
+                                members: Vec::new(),
+                            });
+                    conv.kind = ChatKind::Group {
+                        title,
+                        you_left: false,
+                    };
+                    conv.members = members;
+
+                    sync_conversations(&ui_weak, &state_lock);
+                    if state_lock.active_conv == Some(conv_id) {
+                        sync_group_panel(&ui_weak, &state_lock);
+                    }
+                }
+                ServerMsg::RemovedFromGroup { conv_id } => {
+                    // The owner who left without transferring keeps the row,
+                    // marked; everyone else loses the conversation entirely.
+                    let keep = state_lock.keep_after_leave == Some(conv_id);
+                    state_lock.keep_after_leave = None;
+                    let was_open = if keep {
+                        park_conversation(&mut state_lock, conv_id)
+                    } else {
+                        drop_conversation(&mut state_lock, conv_id)
+                    };
+                    if was_open {
+                        let weak = ui_weak.clone();
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.set_active_peer_id(-1);
+                                ui.set_active_peer_login("".into());
+                                ui.set_dialog_open(false);
+                                ui.set_active_conv_id("".into());
+                                ui.set_active_title("".into());
+                                // Off the panel of a group that is no more.
+                                ui.set_current_screen(1);
+                            }
+                        })
+                        .ok();
+                        sync_messages(&ui_weak, &state_lock);
+                    }
+                    sync_conversations(&ui_weak, &state_lock);
                 }
                 ServerMsg::UserFound { user } => {
                     let (chat_id, login) = (user.user_id, user.login.clone());
@@ -936,14 +1509,37 @@ impl AppController {
                 }
                 ServerMsg::DmResolved { conv_id, peer } => {
                     state_lock.conv.insert(peer.user_id, conv_id);
+                    // A conversation is born the moment it is resolved, the
+                    // list gets its row right away.
+                    state_lock
+                        .conversations
+                        .entry(conv_id)
+                        .or_insert_with(|| Conversation {
+                            kind: ChatKind::Private { peer: peer.clone() },
+                            unread: 0,
+                            last: None,
+                            members: Vec::new(),
+                        });
                     if state_lock.active_peer_id == Some(peer.user_id) {
                         state_lock.active_conv = Some(conv_id);
+                        let conv_str: SharedString = conv_id.to_string().into();
+                        let login = peer.login.clone();
+                        let weak = ui_weak.clone();
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = weak.upgrade() {
+                                ui.set_active_conv_id(conv_str);
+                                ui.set_active_title(login.into());
+                                ui.set_dialog_open(true);
+                            }
+                        })
+                        .ok();
                         sync_messages(&ui_weak, &state_lock);
                         let guard = sender_slot.lock().unwrap();
                         if let Some(tx) = guard.as_ref() {
                             let _ = tx.send(ClientMsg::HistoryReq { conv_id });
                         }
                     }
+                    sync_conversations(&ui_weak, &state_lock);
                 }
                 ServerMsg::UserNotFound => {
                     slint::invoke_from_event_loop(move || {
@@ -958,6 +1554,22 @@ impl AppController {
                     conv_id,
                 } => {
                     state_lock.pending.remove(&message_id);
+                    // The list's second line is this message now; the
+                    // conversation moves to the top on its own account.
+                    let last = state_lock
+                        .messages
+                        .get(&conv_id)
+                        .and_then(|msgs| msgs.iter().rev().find(|m| m.id == message_id))
+                        .map(|m| LastMsg {
+                            sender_user_id: m.sender_user_id,
+                            timestamp: m.timestamp,
+                            text: m.text.clone(),
+                        });
+                    if let (Some(conv), Some(last)) =
+                        (state_lock.conversations.get_mut(&conv_id), last)
+                    {
+                        conv.last = Some(last);
+                    }
                     if let Some(msgs) = state_lock.messages.get_mut(&conv_id) {
                         if let Some(m) = msgs.iter_mut().find(|m| m.id == message_id) {
                             // Below Read, not below Sent: an acknowledgement
@@ -969,6 +1581,7 @@ impl AppController {
                         }
                     }
                     sync_messages(&ui_weak, &state_lock);
+                    sync_conversations(&ui_weak, &state_lock);
                 }
                 ServerMsg::MsgRead {
                     message_id,
@@ -1010,10 +1623,25 @@ impl AppController {
                         if let Some(tx) = guard.as_ref() {
                             let _ = tx.send(ClientMsg::MarkRead { message_id });
                         }
+                        // Read on arrival, but the list still needs the new
+                        // last line and the top spot.
+                        if let Some(conv) = state_lock.conversations.get_mut(&conv_id) {
+                            conv.last = Some(LastMsg {
+                                sender_user_id,
+                                timestamp,
+                                text: content,
+                            });
+                        }
                     } else {
-                        *state_lock.unread.entry(sender_user_id).or_insert(0) += 1;
-                        sync_friends(&ui_weak, &state_lock);
+                        bump_unread(
+                            &mut state_lock,
+                            conv_id,
+                            sender_user_id,
+                            &content,
+                            timestamp,
+                        );
                     }
+                    sync_conversations(&ui_weak, &state_lock);
                 }
                 _ => {}
             },
@@ -1021,16 +1649,59 @@ impl AppController {
     }
 }
 
-fn build_model_friends(state: &ChatState) -> Vec<FriendEntry> {
-    state
-        .friends
+/// The conversation list, the freshest first. A row with no last message
+/// has nothing to sort by and sinks to the bottom, where it waits for its
+/// first message.
+fn build_model_conversations(state: &ChatState) -> Vec<ConvEntry> {
+    let mut rows: Vec<(i64, ConvEntry)> = state
+        .conversations
         .iter()
-        .map(|f| FriendEntry {
-            login: f.login.clone().into(),
-            user_id: f.user_id as i32,
-            unread: state.unread.get(&f.user_id).copied().unwrap_or(0) as i32,
+        .map(|(conv_id, conv)| {
+            let (title, is_group, you_left) = match &conv.kind {
+                ChatKind::Private { peer } => {
+                    let login = if peer.login.is_empty() {
+                        state
+                            .friends
+                            .iter()
+                            .find(|f| f.user_id == peer.user_id)
+                            .map(|f| f.login.clone())
+                            .unwrap_or_else(|| "...".to_string())
+                    } else {
+                        peer.login.clone()
+                    };
+                    (login, false, false)
+                }
+                ChatKind::Group { title, you_left } => (title.clone(), true, *you_left),
+            };
+            let last = conv.last.as_ref();
+            let row = ConvEntry {
+                conv_id: conv_id.to_string().into(),
+                title: title.into(),
+                preview: last.map(|l| l.text.clone()).unwrap_or_default().into(),
+                time: last
+                    .map(|l| format_time(l.timestamp))
+                    .unwrap_or_else(|| "".into()),
+                is_group,
+                you_left,
+                unread: conv.unread.min(i32::MAX as usize) as i32,
+                badge: if conv.unread == 0 {
+                    String::new()
+                } else if conv.unread > 99 {
+                    "99+".to_string()
+                } else {
+                    conv.unread.to_string()
+                }
+                .into(),
+            };
+            (last.map(|l| l.timestamp).unwrap_or(0), row)
         })
-        .collect()
+        .collect();
+
+    rows.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.title.to_string().cmp(&b.1.title.to_string()))
+    });
+    rows.into_iter().map(|(_, row)| row).collect()
 }
 
 /// Nothing open, or the conversation is not known yet.
@@ -1151,22 +1822,125 @@ fn spawn_retry_task(state: Arc<Mutex<ChatState>>, sender_slot: CmdSender, ui: We
     });
 }
 
-/// Counts arrive per conversation, the friend list keys them by peer. The
-/// conversation id is not kept: opening the chat resolves it again.
-fn unread_from_summary(entries: Vec<UnreadEntry>) -> HashMap<i64, usize> {
+/// The login state of the conversation list, straight from ChatList.
+fn conversations_from_entries(entries: &[ChatEntry]) -> HashMap<Uuid, Conversation> {
     entries
-        .into_iter()
-        .map(|entry| (entry.peer.user_id, entry.count as usize))
+        .iter()
+        .map(|entry| {
+            (
+                entry.conv_id,
+                Conversation {
+                    kind: entry.kind.clone(),
+                    unread: entry.unread as usize,
+                    last: entry.last.as_ref().map(|l| LastMsg {
+                        sender_user_id: l.sender_user_id,
+                        timestamp: l.timestamp,
+                        text: l.preview.clone(),
+                    }),
+                    members: Vec::new(),
+                },
+            )
+        })
         .collect()
 }
 
-fn sync_friends(ui_weak: &Weak<MainWindow>, state: &ChatState) {
-    let entries = build_model_friends(state);
+/// A message arrived outside the open dialog. An unknown conversation still
+/// counts: a friend's first message can arrive before their dialog was ever
+/// opened, and the badge belongs to the friend either way.
+fn bump_unread(
+    state: &mut ChatState,
+    conv_id: Uuid,
+    sender_user_id: i64,
+    text: &str,
+    timestamp: i64,
+) {
+    if !state.conversations.contains_key(&conv_id) {
+        // A conversation the client never resolved can only be a private
+        // one, and the sender is the peer. The login arrives with the next
+        // ChatList; the badge works without it.
+        state.conv.insert(sender_user_id, conv_id);
+        state.conversations.insert(
+            conv_id,
+            Conversation {
+                kind: ChatKind::Private {
+                    peer: UserBrief {
+                        user_id: sender_user_id,
+                        login: String::new(),
+                    },
+                },
+                unread: 0,
+                last: None,
+                members: Vec::new(),
+            },
+        );
+    }
+    let conv = state
+        .conversations
+        .get_mut(&conv_id)
+        .expect("the conversation was just inserted");
+    conv.unread += 1;
+    conv.last = Some(LastMsg {
+        sender_user_id,
+        timestamp,
+        text: text.to_string(),
+    });
+}
+
+/// The owner's leave-without-transfer: the group stays in the list, marked
+/// as left, the way the server's next ChatList will describe it too. The
+/// messages, the dialog and the stale membership go; what stays is the way
+/// back.
+fn park_conversation(state: &mut ChatState, conv_id: Uuid) -> bool {
+    state.messages.remove(&conv_id);
+    state.conv.retain(|_, c| *c != conv_id);
+    let was_open = if state.active_conv == Some(conv_id) {
+        state.active_conv = None;
+        state.active_peer_id = None;
+        state.active_peer_login.clear();
+        true
+    } else {
+        false
+    };
+    if let Some(conv) = state.conversations.get_mut(&conv_id) {
+        let title = match &conv.kind {
+            ChatKind::Group { title, .. } => title.clone(),
+            ChatKind::Private { .. } => String::new(),
+        };
+        conv.kind = ChatKind::Group {
+            title,
+            you_left: true,
+        };
+        conv.unread = 0;
+        conv.last = None;
+        conv.members.clear();
+    }
+    was_open
+}
+
+/// The conversation is gone for this user: left, removed, or the group
+/// deleted. Everything known about it goes, and if it was the open dialog,
+/// the dialog closes. Returns whether the open dialog was the one removed.
+fn drop_conversation(state: &mut ChatState, conv_id: Uuid) -> bool {
+    state.conversations.remove(&conv_id);
+    state.messages.remove(&conv_id);
+    state.conv.retain(|_, c| *c != conv_id);
+    if state.active_conv == Some(conv_id) {
+        state.active_conv = None;
+        state.active_peer_id = None;
+        state.active_peer_login.clear();
+        true
+    } else {
+        false
+    }
+}
+
+fn sync_conversations(ui_weak: &Weak<MainWindow>, state: &ChatState) {
+    let entries = build_model_conversations(state);
     let ui_weak = ui_weak.clone();
     slint::invoke_from_event_loop(move || {
         if let Some(ui) = ui_weak.upgrade() {
-            let model = ui.get_friends_list();
-            if let Some(model) = model.as_any().downcast_ref::<VecModel<FriendEntry>>() {
+            let model = ui.get_conversations_list();
+            if let Some(model) = model.as_any().downcast_ref::<VecModel<ConvEntry>>() {
                 model.set_vec(entries);
             }
         }
@@ -1174,9 +1948,198 @@ fn sync_friends(ui_weak: &Weak<MainWindow>, state: &ChatState) {
     .ok();
 }
 
+/// The contacts screen: friends, with the new-group selection flags, and
+/// the pending requests.
+fn sync_contacts(ui_weak: &Weak<MainWindow>, state: &ChatState, selection: &HashSet<i64>) {
+    let friends = state
+        .friends
+        .iter()
+        .map(|f| FriendCheckEntry {
+            user_id: f.user_id as i32,
+            login: f.login.clone().into(),
+            selected: selection.contains(&f.user_id),
+        })
+        .collect::<Vec<_>>();
+    let requests = state
+        .incoming_reqs
+        .iter()
+        .map(|u| RequestEntry {
+            user_id: u.user_id as i32,
+            login: u.login.clone().into(),
+        })
+        .collect::<Vec<_>>();
+    let ui_weak = ui_weak.clone();
+    slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui_weak.upgrade() {
+            let friends_model = ui.get_contacts_friends();
+            if let Some(model) = friends_model
+                .as_any()
+                .downcast_ref::<VecModel<FriendCheckEntry>>()
+            {
+                model.set_vec(friends);
+            }
+            let requests_model = ui.get_contacts_requests();
+            if let Some(model) = requests_model
+                .as_any()
+                .downcast_ref::<VecModel<RequestEntry>>()
+            {
+                model.set_vec(requests);
+            }
+        }
+    })
+    .ok();
+}
+
+/// Everything the group panel shows, derived from the open conversation.
+/// `None` when no conversation is open or it is not a group.
+struct PanelData {
+    title: String,
+    you_left: bool,
+    im_owner: bool,
+    my_rights: AdminRights,
+    members: Vec<MemberEntry>,
+    /// Friends who are not members yet, the ComboBox of the invite row.
+    addable: Vec<SharedString>,
+}
+
+fn panel_data(state: &ChatState) -> Option<PanelData> {
+    let conv_id = state.active_conv?;
+    let conv = state.conversations.get(&conv_id)?;
+    let ChatKind::Group { title, you_left } = &conv.kind else {
+        return None;
+    };
+
+    let mine = conv
+        .members
+        .iter()
+        .find(|m| m.user.user_id == state.my_user_id);
+    let im_owner = mine.is_some_and(|m| m.role == MemberRole::Owner);
+    // Ownership is the full set, stored nowhere.
+    let my_rights = if im_owner {
+        AdminRights {
+            change_info: true,
+            invite_users: true,
+            ban_users: true,
+            add_admins: true,
+        }
+    } else {
+        mine.map(|m| m.rights).unwrap_or_default()
+    };
+
+    let member_ids: HashSet<i64> = conv.members.iter().map(|m| m.user.user_id).collect();
+    let members = conv
+        .members
+        .iter()
+        .map(|m| {
+            let role = match m.role {
+                MemberRole::Owner => 0,
+                MemberRole::Admin => 1,
+                MemberRole::Member => 2,
+            };
+            let target_is_owner = m.role == MemberRole::Owner;
+            let target_is_admin = m.role == MemberRole::Admin;
+            MemberEntry {
+                user_id: m.user.user_id as i32,
+                login: m.user.login.clone().into(),
+                role,
+                // `ban_users` reaches members; an administrator is the
+                // owner's to remove.
+                can_remove: !target_is_owner
+                    && (im_owner || (my_rights.ban_users && !target_is_admin)),
+                // Appointing and reshaping admins is the owner's;
+                // `add_admins` lets a plain admin appoint members only.
+                can_edit: !target_is_owner
+                    && (im_owner || (my_rights.add_admins && !target_is_admin)),
+                change_info: m.rights.change_info,
+                invite_users: m.rights.invite_users,
+                ban_users: m.rights.ban_users,
+                add_admins: m.rights.add_admins,
+            }
+        })
+        .collect();
+
+    let addable = state
+        .friends
+        .iter()
+        .filter(|f| !member_ids.contains(&f.user_id))
+        .map(|f| f.login.clone().into())
+        .collect();
+
+    Some(PanelData {
+        title: title.clone(),
+        you_left: *you_left,
+        im_owner,
+        my_rights,
+        members,
+        addable,
+    })
+}
+
+/// Writes the panel as it is now. Also refreshes the open dialog's header,
+/// a rename has to reach it the same way it reaches the panel.
+fn apply_panel(ui: &MainWindow, data: &PanelData) {
+    let members_model = ui.get_group_members();
+    if let Some(model) = members_model
+        .as_any()
+        .downcast_ref::<VecModel<MemberEntry>>()
+    {
+        model.set_vec(data.members.clone());
+    }
+    let addable_model = ui.get_group_addable();
+    if let Some(model) = addable_model
+        .as_any()
+        .downcast_ref::<VecModel<SharedString>>()
+    {
+        model.set_vec(data.addable.clone());
+    }
+
+    ui.set_group_perm_change_info(data.im_owner || data.my_rights.change_info);
+    ui.set_group_perm_invite(data.im_owner || data.my_rights.invite_users);
+    ui.set_group_perm_ban(data.im_owner || data.my_rights.ban_users);
+    ui.set_group_perm_add_admins(data.im_owner || data.my_rights.add_admins);
+    ui.set_group_im_owner(data.im_owner);
+    ui.set_group_you_left(data.you_left);
+
+    ui.set_active_title(data.title.clone().into());
+    ui.set_active_members_label(format!("{} members", data.members.len()).into());
+
+    // The member list changed under the editor: keep the editor honest
+    // about whoever is still selected.
+    let selected = ui.get_group_selected_member();
+    if selected >= 0 {
+        match data.members.iter().find(|m| m.user_id == selected) {
+            Some(m) => {
+                ui.set_group_editor_visible(m.can_edit);
+                ui.set_edit_change_info(m.change_info);
+                ui.set_edit_invite_users(m.invite_users);
+                ui.set_edit_ban_users(m.ban_users);
+                ui.set_edit_add_admins(m.add_admins);
+            }
+            None => {
+                ui.set_group_selected_member(-1);
+                ui.set_group_editor_visible(false);
+            }
+        }
+    }
+}
+
+/// Refreshes the panel when the group changed while the panel shows it.
+fn sync_group_panel(ui_weak: &Weak<MainWindow>, state: &ChatState) {
+    let data = panel_data(state);
+    let ui_weak = ui_weak.clone();
+    slint::invoke_from_event_loop(move || {
+        if let (Some(ui), Some(data)) = (ui_weak.upgrade(), data) {
+            apply_panel(&ui, &data);
+        }
+    })
+    .ok();
+}
+
 /// The only place that writes the message model, shared by `sync_messages` and `sync_messages_now`.
-fn write_messages(ui: &MainWindow, peer_i32: i32, entries: Vec<MessageEntry>) {
-    if ui.get_active_peer_id() != peer_i32 {
+/// The conversation, not the peer, is the dialog's identity: a group has no
+/// peer to name it by.
+fn write_messages(ui: &MainWindow, conv_id: &str, entries: Vec<MessageEntry>) {
+    if ui.get_active_conv_id() != conv_id {
         return;
     }
     let model = ui.get_active_chat_messages();
@@ -1198,14 +2161,14 @@ fn sync_messages_at_bottom(ui_weak: &Weak<MainWindow>, state: &ChatState) {
 
 fn push_messages(ui_weak: &Weak<MainWindow>, state: &ChatState, follow_newest: bool) {
     let entries = build_model_active(state);
-    let peer_i32 = state.active_peer_id.unwrap_or(-1) as i32;
+    let conv_id = state.active_conv.map(|c| c.to_string()).unwrap_or_default();
     let ui_weak = ui_weak.clone();
     slint::invoke_from_event_loop(move || {
         if let Some(ui) = ui_weak.upgrade() {
             if follow_newest {
                 end_at_newest(&ui);
             }
-            write_messages(&ui, peer_i32, entries);
+            write_messages(&ui, &conv_id, entries);
         }
     })
     .ok();
@@ -1215,7 +2178,7 @@ fn push_messages(ui_weak: &Weak<MainWindow>, state: &ChatState, follow_newest: b
 /// the reader is up in the history, and the message is counted instead.
 fn push_incoming_message(ui_weak: &Weak<MainWindow>, state: &ChatState) {
     let entries = build_model_active(state);
-    let peer_i32 = state.active_peer_id.unwrap_or(-1) as i32;
+    let conv_id = state.active_conv.map(|c| c.to_string()).unwrap_or_default();
     let ui_weak = ui_weak.clone();
     slint::invoke_from_event_loop(move || {
         if let Some(ui) = ui_weak.upgrade() {
@@ -1223,7 +2186,7 @@ fn push_incoming_message(ui_weak: &Weak<MainWindow>, state: &ChatState) {
             // a reader who was at the bottom scrolled up.
             let missed = next_missed_count(ui.get_missed_count(), ui.get_chat_at_bottom());
             ui.set_missed_count(missed);
-            write_messages(&ui, peer_i32, entries);
+            write_messages(&ui, &conv_id, entries);
         }
     })
     .ok();
@@ -1269,14 +2232,20 @@ fn next_missed_count(missed: i32, at_bottom: bool) -> i32 {
 /// the time they return, or the caller cannot set `chat-at-bottom` before
 /// the write that would raise `changed content-height`.
 fn sync_messages_now(ui: &MainWindow, state: &ChatState) {
-    write_messages(
-        ui,
-        state.active_peer_id.unwrap_or(-1) as i32,
-        build_model_active(state),
-    );
+    let conv_id = state.active_conv.map(|c| c.to_string()).unwrap_or_default();
+    write_messages(ui, &conv_id, build_model_active(state));
 }
 
 fn build_model_msgs(state: &ChatState, conv_id: Uuid) -> Vec<MessageEntry> {
+    // In a group the bubble needs the writer's name; a private chat has the
+    // peer in the header already.
+    let members = state
+        .conversations
+        .get(&conv_id)
+        .filter(|conv| matches!(conv.kind, ChatKind::Group { .. }))
+        .map(|conv| conv.members.clone())
+        .unwrap_or_default();
+
     state
         .messages
         .get(&conv_id)
@@ -1287,6 +2256,16 @@ fn build_model_msgs(state: &ChatState, conv_id: Uuid) -> Vec<MessageEntry> {
                     time: format_time(m.timestamp),
                     is_outgoing: m.outgoing,
                     status: m.status as i32,
+                    sender_name: if !m.outgoing {
+                        members
+                            .iter()
+                            .find(|u| u.user.user_id == m.sender_user_id)
+                            .map(|u| u.user.login.clone())
+                            .unwrap_or_default()
+                            .into()
+                    } else {
+                        "".into()
+                    },
                 })
                 .collect()
         })
@@ -1322,10 +2301,14 @@ pub(crate) fn is_at_bottom(content_height: f32, view_height: f32, content_y: f32
 
 #[cfg(test)]
 mod tests {
+    use super::{ChatState, Conversation};
     use chrono::{DateTime, FixedOffset};
+    use std::collections::HashMap;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
-    use zeevum_protocol::{UnreadEntry, UserBrief};
+    use zeevum_protocol::{
+        AdminRights, ChatEntry, ChatKind, GroupMember, LastMessage, MemberRole, UserBrief,
+    };
 
     /// The worry this covers: a sender two hours ahead must not make the
     /// reader see the sender's clock. The stamp is an instant, so the same
@@ -1489,33 +2472,182 @@ mod tests {
         );
     }
 
-    /// The friend list shows a badge per friend, and the summary arrives
-    /// keyed by conversation.
+    fn empty_state() -> ChatState {
+        ChatState {
+            my_user_id: 1,
+            active_peer_id: None,
+            active_peer_login: String::new(),
+            active_conv: None,
+            conv: HashMap::new(),
+            server_addr: String::new(),
+            login: String::new(),
+            friends: Vec::new(),
+            messages: HashMap::new(),
+            incoming_reqs: Vec::new(),
+            conversations: HashMap::new(),
+            pending: HashMap::new(),
+            keep_after_leave: None,
+        }
+    }
+
+    /// The list arrives per conversation, the friend badge is the private
+    /// conversation's count, and the peer map is filled so opening a
+    /// friend's dialog never waits for ResolveDm.
     #[test]
-    fn unread_counts_are_keyed_by_peer() {
+    fn chat_list_fills_conversations_and_the_peer_map() {
+        let peer_conv = Uuid::new_v4();
+        let group_conv = Uuid::new_v4();
         let entries = vec![
-            UnreadEntry {
-                conv_id: Uuid::new_v4(),
-                peer: UserBrief {
-                    user_id: 7,
-                    login: "alice".into(),
+            ChatEntry {
+                conv_id: peer_conv,
+                kind: ChatKind::Private {
+                    peer: UserBrief {
+                        user_id: 7,
+                        login: "alice".into(),
+                    },
                 },
-                count: 3,
+                unread: 3,
+                last: Some(LastMessage {
+                    message_id: Uuid::new_v4(),
+                    sender_user_id: 7,
+                    timestamp: 1,
+                    preview: "hi".into(),
+                }),
             },
-            UnreadEntry {
-                conv_id: Uuid::new_v4(),
-                peer: UserBrief {
-                    user_id: 9,
-                    login: "bob".into(),
+            ChatEntry {
+                conv_id: group_conv,
+                kind: ChatKind::Group {
+                    title: "dacha".into(),
+                    you_left: true,
                 },
-                count: 1,
+                unread: 0,
+                last: None,
             },
         ];
 
-        let counts = super::unread_from_summary(entries);
-        assert_eq!(counts.len(), 2);
-        assert_eq!(counts.get(&7), Some(&3));
-        assert_eq!(counts.get(&9), Some(&1));
+        let mut state = empty_state();
+        state.conversations = super::conversations_from_entries(&entries);
+        for entry in &entries {
+            if let ChatKind::Private { peer } = &entry.kind {
+                state.conv.insert(peer.user_id, entry.conv_id);
+            }
+        }
+
+        assert_eq!(state.unread_for_friend(7), 3);
+        assert_eq!(state.unread_for_friend(9), 0);
+        assert_eq!(
+            state.conversations[&peer_conv].last.as_ref().unwrap().text,
+            "hi"
+        );
+        assert!(matches!(
+            &state.conversations[&group_conv].kind,
+            ChatKind::Group { you_left: true, .. }
+        ));
+    }
+
+    /// A friend's first message can arrive before their dialog was ever
+    /// opened. The conversation is created by the message itself, and the
+    /// badge belongs to the friend.
+    #[test]
+    fn an_unknown_conversation_still_counts_unread() {
+        let mut state = empty_state();
+        let conv = Uuid::new_v4();
+
+        super::bump_unread(&mut state, conv, 42, "hello", 5);
+        assert_eq!(state.unread_for_friend(42), 1);
+
+        super::bump_unread(&mut state, conv, 42, "again", 6);
+        assert_eq!(state.unread_for_friend(42), 2);
+        assert_eq!(
+            state.conversations[&conv].last.as_ref().unwrap().text,
+            "again"
+        );
+    }
+
+    /// Leaving, being removed, or the group being deleted ends the
+    /// conversation: no list entry, no cached messages, no peer mapping,
+    /// and an open dialog closes.
+    #[test]
+    fn a_removed_conversation_leaves_no_trace() {
+        let mut state = empty_state();
+        let conv = Uuid::new_v4();
+        state.conv.insert(7, conv);
+        state.conversations.insert(
+            conv,
+            Conversation {
+                kind: ChatKind::Private {
+                    peer: UserBrief {
+                        user_id: 7,
+                        login: "alice".into(),
+                    },
+                },
+                unread: 2,
+                last: None,
+                members: vec![GroupMember {
+                    user: UserBrief {
+                        user_id: 7,
+                        login: "alice".into(),
+                    },
+                    role: MemberRole::Owner,
+                    rights: AdminRights::default(),
+                }],
+            },
+        );
+        state.messages.insert(conv, Vec::new());
+        state.active_conv = Some(conv);
+        state.active_peer_id = Some(7);
+
+        assert!(super::drop_conversation(&mut state, conv));
+        assert!(state.conversations.is_empty());
+        assert!(state.messages.is_empty());
+        assert!(state.conv.is_empty());
+        assert!(state.active_conv.is_none());
+        assert!(state.active_peer_id.is_none());
+    }
+
+    /// The owner's leave-without-transfer parks the group: the row stays in
+    /// the list, marked the way the server's next ChatList will describe it,
+    /// while a plain removal erases the conversation entirely.
+    #[test]
+    fn an_owner_who_keeps_the_group_parks_it_marked() {
+        let mut state = empty_state();
+        let conv = Uuid::new_v4();
+        state.conversations.insert(
+            conv,
+            Conversation {
+                kind: ChatKind::Group {
+                    title: "the club".into(),
+                    you_left: false,
+                },
+                unread: 3,
+                last: None,
+                members: vec![GroupMember {
+                    user: UserBrief {
+                        user_id: 1,
+                        login: "me".into(),
+                    },
+                    role: MemberRole::Owner,
+                    rights: AdminRights::default(),
+                }],
+            },
+        );
+        state.messages.insert(conv, Vec::new());
+        state.active_conv = Some(conv);
+
+        assert!(super::park_conversation(&mut state, conv));
+        let parked = state.conversations.get(&conv).unwrap();
+        match &parked.kind {
+            ChatKind::Group { title, you_left } => {
+                assert_eq!(title, "the club");
+                assert!(you_left);
+            }
+            ChatKind::Private { .. } => panic!("a parked group turned private"),
+        }
+        assert_eq!(parked.unread, 0);
+        assert!(parked.last.is_none());
+        assert!(parked.members.is_empty());
+        assert!(state.messages.is_empty());
+        assert!(state.active_conv.is_none());
     }
 
     /// A message is counted only while the reader is away from the bottom.

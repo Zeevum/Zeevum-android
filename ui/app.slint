@@ -1,4 +1,4 @@
-import { VerticalBox, HorizontalBox, LineEdit, Button, ListView, ScrollView } from "std-widgets.slint";
+import { VerticalBox, HorizontalBox, LineEdit, Button, ListView, ScrollView, CheckBox, ComboBox } from "std-widgets.slint";
 
 struct FriendEntry {
     login: string,
@@ -11,29 +11,178 @@ struct MessageEntry {
     time: string,
     is-outgoing: bool,
     status: int,
+    // Groups only: who wrote it. Empty in a private chat, the peer is the
+    // only other writer and the header already names them.
+    sender-name: string,
 }
 
-component FriendItem inherits Rectangle {
-    in property <FriendEntry> entry;
+struct ConvEntry {
+    conv-id: string,
+    title: string,
+    preview: string,
+    time: string,
+    is-group: bool,
+    you-left: bool,
+    unread: int,
+    // The badge as text, so the "99+" clamp lives in one place, in Rust.
+    badge: string,
+}
+
+struct MemberEntry {
+    user-id: int,
+    login: string,
+    // 0 owner, 1 admin, 2 member.
+    role: int,
+    can-remove: bool,
+    can-edit: bool,
+    change-info: bool,
+    invite-users: bool,
+    ban-users: bool,
+    add-admins: bool,
+}
+
+struct FriendCheckEntry {
+    user-id: int,
+    login: string,
+    selected: bool,
+}
+
+struct RequestEntry {
+    user-id: int,
+    login: string,
+}
+
+/// The palette, one place for every color. Roles, not widgets: the day
+/// this list is rewritten, the whole client changes clothes. Values are
+/// Telegram's dark ones where they are known for sure (bubbles, the
+/// blues), the client's own where Telegram has nothing to say (danger,
+/// online). The full map and provenance: zeevum/THEME-TELEGRAM.md.
+export global Theme {
+    // Surfaces
+    out property <color> window-bg: #17212b;   // panels, rows, the flat list
+    out property <color> chat-bg: #0e1621;     // the message canvas, darker than the chrome
+    out property <color> hover-bg: #202b36;    // a row under the pointer
+    out property <color> active-row: #2b5278;  // the current conversation
+    out property <color> bubble-in: #182533;   // someone else's words
+    out property <color> bubble-out: #2b5278;  // one's own
+    // Text
+    out property <color> text: #ffffff;
+    out property <color> text-sub: #a8a8a8;    // time, previews, statuses
+    out property <color> text-hint: #d7d7d7;   // labels, helper lines
+    // Accents
+    out property <color> accent: #4082bc;      // links, badges, the chosen
+    out property <color> on-accent: #ffffff;   // anything sitting on accent
+    out property <color> meta-out: #8ccbda;    // time and ticks on one's own bubbles
+    out property <color> danger: #ff5555;
+    out property <color> online: #55aa55;
+    out property <color> sender: #9ecbff;      // one color until the peer palette (stage 3)
+    // The rest
+    out property <color> track: #2d2d2d;       // the strength bar's runway
+    out property <color> scrim: #000000b0;     // behind modal overlays
+}
+
+/// The type scale, one place for every size. A role per job, not a
+/// number per widget: screens speak at display, panels at title, rows
+/// at row, and everything without an opinion inherits the window
+/// default - body, the size a message is read at.
+export global Type {
+    out property <length> display: 26px;   // screen titles: auth, register, contacts
+    out property <length> title: 20px;     // panel headers, the chat header, box titles
+    out property <length> section: 14px;   // list section labels (Friends, Requests)
+    out property <length> row: 15px;       // row titles: conversations, members, friends
+    out property <length> body: 14px;      // message text, inputs, buttons - the window default
+    out property <length> secondary: 12px; // previews, hints, member counts
+    out property <length> caption: 11px;   // timestamps, roles, sender names, link status
+    out property <length> badge: 10px;     // the unread digit
+}
+
+/// The grid, one place for every gap, pad and radius. Values snap to
+/// the 4/8/12/16 ladder; the zeros of layout scaffolding stay zeros.
+export global Metrics {
+    out property <length> gap-xs: 2px;    // micro: title to time inside a row
+    out property <length> gap-s: 4px;     // inside a widget
+    out property <length> gap: 8px;       // between widgets
+    out property <length> gap-l: 12px;    // between rows of a form
+    out property <length> gap-xl: 16px;   // between sections
+    out property <length> pad-s: 4px;
+    out property <length> pad: 8px;
+    out property <length> pad-l: 12px;
+    out property <length> pad-xl: 16px;
+    out property <length> pad-xxl: 20px;  // a screen's padding
+    out property <length> radius-xs: 3px; // progress tracks
+    out property <length> radius-s: 6px;  // small icon buttons
+    out property <length> radius: 8px;    // bubbles, large icon buttons
+    out property <length> radius-l: 10px; // overlay boxes
+}
+
+component ConvItem inherits Rectangle {
+    in property <ConvEntry> entry;
     callback clicked;
 
-    height: 50px;
-    background: ta.has-hover ? #2a2a3a : #1e1e2e;
+    height: 56px;
+    background: ta.has-hover ? Theme.hover-bg : Theme.window-bg;
 
-    HorizontalBox {
-        padding: 10px;
-        spacing: 10px;
-        Text {
-            text: entry.login;
-            font-size: 16px;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
+    VerticalLayout {
+        padding: Metrics.pad;
+        padding-right: 12px;
+        spacing: Metrics.gap-xs;
+
+        HorizontalLayout {
+            spacing: Metrics.gap;
+            Text {
+                text: entry.title;
+                font-size: Type.row;
+                font-weight: 700;
+                color: Theme.text;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            Text {
+                text: entry.time;
+                font-size: Type.caption;
+                color: Theme.text-sub;
+                vertical-alignment: center;
+            }
         }
-        if entry.unread > 0 : Rectangle {
-            width: 10px;
-            height: 10px;
-            background: #ff5555;
-            border-radius: 5px;
+
+        HorizontalLayout {
+            spacing: Metrics.gap;
+            Text {
+                text: entry.you-left ? "left - still yours" : entry.preview;
+                font-size: Type.secondary;
+                color: Theme.text-sub;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            if entry.badge != "" : Rectangle {
+                // The shape is an SVG disc, stretched to a capsule when the
+                // number is wide: the software renderer rasterizes SVG with
+                // antialiasing, while its own rounded corners have none.
+                height: 18px;
+                width: entry.badge.character-count <= 1
+                    ? 18px
+                    : badge-digit.preferred-width + 14px;
+
+                Image {
+                    source: @image-url("icons/disc.svg");
+                    width: 100%;
+                    height: 100%;
+                    colorize: Theme.accent;
+                }
+
+                badge-digit := Text {
+                    width: 100%;
+                    height: 100%;
+                    text: entry.badge;
+                    color: Theme.on-accent;
+                    font-size: Type.badge;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
         }
     }
 
@@ -42,83 +191,97 @@ component FriendItem inherits Rectangle {
     }
 }
 
-/// The delivery state, drawn rather than picked out of a font. A font owes
-/// us none of these glyphs, and where it has them they are never the same
-/// weight as each other, so the two marks never looked like a pair.
+component MemberItem inherits Rectangle {
+    in property <MemberEntry> entry;
+    in property <bool> selected;
+    callback clicked;
+    callback remove-clicked;
+
+    height: 40px;
+    background: selected ? Theme.active-row : (ta.has-hover ? Theme.hover-bg : Theme.window-bg);
+
+    HorizontalLayout {
+        padding: Metrics.pad;
+        spacing: Metrics.gap;
+        Text {
+            text: entry.login;
+            font-size: Type.row;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: entry.role == 0 ? "owner" : entry.role == 1 ? "admin" : "";
+            color: Theme.accent;
+            font-size: Type.caption;
+            vertical-alignment: center;
+        }
+        if entry.can-remove : VerticalLayout {
+            alignment: LayoutAlignment.center;
+            Rectangle {
+                width: 32px;
+                height: 32px;
+                border-radius: Metrics.radius-s;
+                background: remove-ta.has-hover ? Theme.hover-bg : transparent;
+                Image {
+                    source: @image-url("icons/x.svg");
+                    width: 16px;
+                    height: 16px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    colorize: Theme.text-sub;
+                }
+                remove-ta := TouchArea {
+                    clicked => { root.remove-clicked(); }
+                }
+            }
+        }
+    }
+
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+/// The delivery state, one Lucide file per state, tinted. The house rule
+/// is SVG for every icon: a font owes us none of these glyphs, and where
+/// it has them they are never the same weight as each other.
 component DeliveryMark inherits Rectangle {
     in-out property <int> status;
 
     // 0 has not reached the server, 1 is stored on it, 2 has been read by
     // the peer, 3 was given up on. The second mark appears only once the
     // peer has read the message, so a second grey one never happens.
-    property <color> tint: root.status == 3 ? #e05555 : root.status == 0 ? #7a8a99 : #5599ff;
-
-    width: root.status == 2 ? 14px : 12px;
-    height: 12px;
+    width: root.status == 2 ? 16px : 14px;
+    height: 14px;
     vertical-stretch: 0;
     background: transparent;
 
-    if root.status == 0 : Path {
-        width: 12px;
-        height: 12px;
-        viewbox-width: 12;
-        viewbox-height: 12;
-        commands: "M 1.4 6 A 4.6 4.6 0 0 1 10.6 6 A 4.6 4.6 0 0 1 1.4 6 M 6 3.3 L 6 6.2 L 8.1 7.3";
-        stroke: root.tint;
-        stroke-width: 1.3px;
+    if root.status == 0 : Image {
+        source: @image-url("icons/clock.svg");
+        width: 100%;
+        height: 100%;
+        colorize: Theme.text-sub;
     }
 
-    if root.status == 1 : Path {
-        width: 12px;
-        height: 12px;
-        viewbox-width: 12;
-        viewbox-height: 12;
-        commands: "M 1.6 6.4 L 4.4 9.2 L 10.4 3.2";
-        stroke: root.tint;
-        stroke-width: 1.6px;
+    if root.status == 1 : Image {
+        source: @image-url("icons/check.svg");
+        width: 100%;
+        height: 100%;
+        colorize: Theme.meta-out;
     }
 
-    if root.status == 2 : Path {
-        width: 14px;
-        height: 12px;
-        viewbox-width: 14;
-        viewbox-height: 12;
-        commands: "M 1.2 6.4 L 3.9 9.1 L 8.3 3.3 M 4.8 6.4 L 7.5 9.1 L 11.9 3.3";
-        stroke: root.tint;
-        stroke-width: 1.6px;
+    if root.status == 2 : Image {
+        source: @image-url("icons/check-check.svg");
+        width: 100%;
+        height: 100%;
+        colorize: Theme.meta-out;
     }
 
-    if root.status == 3 : Rectangle {
-        width: 12px;
-        height: 12px;
-        background: transparent;
-
-        Path {
-            width: 12px;
-            height: 12px;
-            viewbox-width: 12;
-            viewbox-height: 12;
-            commands: "M 6 1.2 L 11.2 10.8 L 0.8 10.8 Z";
-            stroke: root.tint;
-            stroke-width: 1.3px;
-        }
-
-        Rectangle {
-            x: 5.1px;
-            y: 3.9px;
-            width: 1.8px;
-            height: 4px;
-            background: root.tint;
-        }
-
-        Rectangle {
-            x: 5.1px;
-            y: 8.6px;
-            width: 1.8px;
-            height: 1.8px;
-            border-radius: 0.9px;
-            background: root.tint;
-        }
+    if root.status == 3 : Image {
+        source: @image-url("icons/triangle-alert.svg");
+        width: 100%;
+        height: 100%;
+        colorize: Theme.danger;
     }
 }
 
@@ -130,8 +293,8 @@ component MessageBubble inherits Rectangle {
     // message does not clip them.
     out property <length> min-bubble-width: 80px;
 
-    background: entry.is-outgoing ? #004e64 : #262633;
-    border-radius: 8px;
+    background: entry.is-outgoing ? Theme.bubble-out : Theme.bubble-in;
+    border-radius: Metrics.radius;
     horizontal-stretch: 0;
     vertical-stretch: 0;
     min-width: min-bubble-width;
@@ -143,25 +306,31 @@ component MessageBubble inherits Rectangle {
     }
 
     VerticalLayout {
-        padding: 10px;
-        spacing: 4px;
+        padding: Metrics.pad-l;
+        spacing: Metrics.gap-s;
+
+        if entry.sender-name != "" : Text {
+            text: entry.sender-name;
+            color: Theme.sender;
+            font-size: Type.caption;
+        }
 
         Text {
             text: entry.text;
-            color: white;
+            color: Theme.text;
             wrap: TextWrap.word-wrap;
             horizontal-alignment: entry.is-outgoing ? TextHorizontalAlignment.right
                                                     : TextHorizontalAlignment.left;
         }
 
         HorizontalLayout {
-            spacing: 5px;
+            spacing: Metrics.gap-s;
             alignment: LayoutAlignment.end;
 
             Text {
                 text: entry.time;
-                color: #9aa0a6;
-                font-size: 11px;
+                color: entry.is-outgoing ? Theme.meta-out : Theme.text-sub;
+                font-size: Type.caption;
                 vertical-alignment: TextVerticalAlignment.center;
             }
 
@@ -177,8 +346,14 @@ component MessageBubble inherits Rectangle {
 component Spinner inherits Rectangle {
     width: 8px;
     height: 8px;
-    border-radius: 4px;
-    background: #9aa0a6;
+    background: transparent;
+
+    Image {
+        source: @image-url("icons/disc.svg");
+        width: 100%;
+        height: 100%;
+        colorize: Theme.text-sub;
+    }
 
     property <float> fade: 1.0;
     init => { self.fade = 0.15; }
@@ -188,15 +363,22 @@ component Spinner inherits Rectangle {
 }
 
 export component MainWindow inherits Window {
-    in-out property <string> window-title: "Rusty Chat";
+    in-out property <string> window-title: "Zeevum";
     title: window-title;
+    default-font-size: Type.body;
     preferred-width: 800px;
     preferred-height: 600px;
 
-    in-out property <int> current-screen: 0; // 0:Auth, 1:Chat, 2:Settings, 3:Search, 4:Register, 5:Password change
+    in-out property <int> current-screen: 0; // 0:Auth, 1:Chat, 2:Settings, 3:Search, 4:Register, 5:Password change, 6:Contacts, 7:Group
     in-out property <string> server-address: "my.domain.com:6969";
     in-out property <string> login-text: "";
     in-out property <string> password-text: "";
+    // The strength must follow the value, not the keyboard: the field is
+    // filled by the login screen through the shared property, and `edited`
+    // never fires for that. `changed` catches both ways.
+    changed password-text => {
+        root.check-password-strength(self.password-text);
+    }
     in-out property <string> confirm-password-text: "";
     // The registration screen offers it; whether it is needed only the
     // server knows, so the field is always there and never required.
@@ -205,7 +387,6 @@ export component MainWindow inherits Window {
     // `password-text`, which is the new one there and drives the strength bar.
     in-out property <string> old-password-text: "";
     in-out property <string> status-message: "";
-    in-out property <[FriendEntry]> friends-list: [];
     in-out property <[MessageEntry]> active-chat-messages: [];
     in-out property <int> active-peer-id: -1;
     in-out property <string> active-peer-login: "";
@@ -220,6 +401,41 @@ export component MainWindow inherits Window {
     // State of the link: 0 idle, 1 connecting, 2 waiting, 3 online.
     in-out property <int> link-state: 0;
 
+    // --- Screen 1: the conversation list and the open dialog ---
+    in-out property <[ConvEntry]> conversations-list: [];
+    // "" means no dialog is open; set for groups and private chats alike.
+    in-out property <bool> dialog-open: false;
+    in-out property <string> active-conv-id: "";
+    in-out property <bool> active-is-group: false;
+    in-out property <string> active-title: "";
+    in-out property <string> active-members-label: "";
+
+    // --- Screen 6: contacts ---
+    in-out property <[FriendCheckEntry]> contacts-friends: [];
+    in-out property <[RequestEntry]> contacts-requests: [];
+    in-out property <bool> contacts-create-mode: false;
+    in-out property <string> group-name-text: "";
+
+    // --- Screen 7: the group panel ---
+    in-out property <[MemberEntry]> group-members: [];
+    in-out property <bool> group-perm-change-info: false;
+    in-out property <bool> group-perm-invite: false;
+    in-out property <bool> group-perm-ban: false;
+    in-out property <bool> group-perm-add-admins: false;
+    in-out property <bool> group-im-owner: false;
+    in-out property <bool> group-you-left: false;
+    in-out property <int> group-selected-member: -1;
+    in-out property <bool> group-editor-visible: false;
+    in-out property <bool> edit-change-info: false;
+    in-out property <bool> edit-invite-users: false;
+    in-out property <bool> edit-ban-users: false;
+    in-out property <bool> edit-add-admins: false;
+    in-out property <[string]> group-addable: [];
+    // The login picked in the add-member combo, empty when nothing is picked.
+    in-out property <string> group-add-name: "";
+    in-out property <string> group-rename-text: "";
+    in-out property <bool> show-leave-confirm: false;
+
     property <float> pw-bar-width:
         root.password-strength == 4 ? 1.0 :
         root.password-strength == 3 ? 0.80 :
@@ -228,7 +444,7 @@ export component MainWindow inherits Window {
         (root.password-text != "" ? 0.15 : 0.0);
 
     property <color> pw-bar-color:
-        root.password-strength <= 1 ? #ff5555 :
+        root.password-strength <= 1 ? Theme.danger :
         root.password-strength == 2 ? #ffaa00 :
         root.password-strength == 3 ? #aaff00 : #00ff00;
 
@@ -240,45 +456,57 @@ export component MainWindow inherits Window {
 
     // --- ЭКРАН АВТОРИЗАЦИИ (0) ---
     VerticalBox {
-        padding: 20px;
-        spacing: 15px;
+        padding: Metrics.pad-xxl;
+        spacing: Metrics.gap-xl;
         visible: root.current-screen == 0;
 
         HorizontalBox {
             Text {
-                text: "Rusty Chat";
-                font-size: 28px;
+                text: "Zeevum";
+                font-size: Type.display;
                 font-weight: 700;
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
-            Button {
-                text: "⚙";
+            Rectangle {
                 width: 40px;
-                clicked => { root.current-screen = 2; }
+                height: 40px;
+                border-radius: Metrics.radius;
+                background: settings-ta.has-hover ? Theme.hover-bg : transparent;
+                Image {
+                    source: @image-url("icons/settings.svg");
+                    width: 20px;
+                    height: 20px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    colorize: Theme.text-hint;
+                }
+                settings-ta := TouchArea {
+                    clicked => { root.current-screen = 2; }
+                }
             }
         }
 
         Text {
             text: status-message;
-            color: #ff5555;
+            color: Theme.danger;
             wrap: TextWrap.word-wrap;
         }
 
         HorizontalBox {
-            spacing: 10px;
+            spacing: Metrics.gap-l;
             Text { text: "Login:"; vertical-alignment: center; min-width: 80px; }
             LineEdit { placeholder-text: "Enter login"; text <=> login-text; horizontal-stretch: 1; }
         }
 
         HorizontalBox {
-            spacing: 10px;
+            spacing: Metrics.gap-l;
             Text { text: "Password:"; vertical-alignment: center; min-width: 80px; }
             LineEdit { input-type: InputType.password; placeholder-text: "Enter password"; text <=> password-text; horizontal-stretch: 1; }
         }
 
         HorizontalBox {
-            spacing: 10px;
+            spacing: Metrics.gap-l;
             Button {
                 text: "Register";
                 horizontal-stretch: 1;
@@ -294,38 +522,38 @@ export component MainWindow inherits Window {
 
     // --- ЭКРАН РЕГИСТРАЦИИ (4) ---
     VerticalBox {
-        padding: 20px;
-        spacing: 15px;
+        padding: Metrics.pad-xxl;
+        spacing: Metrics.gap-xl;
         visible: root.current-screen == 4;
 
         Text {
             text: "Register";
-            font-size: 24px;
+            font-size: Type.display;
             font-weight: 700;
             horizontal-alignment: center;
         }
 
         LineEdit { placeholder-text: "Login (3-32 chars, a-z, 0-9, _)"; text <=> login-text; }
         LineEdit { placeholder-text: "Invite code (if required)"; text <=> invite-text; }
-        LineEdit { input-type: InputType.password; placeholder-text: "Password"; text <=> password-text; edited => { root.check-password-strength(password-text); } }
+        LineEdit { input-type: InputType.password; placeholder-text: "Password"; text <=> password-text; }
 
         Rectangle {
-            height: 6px; background: #2d2d2d; border-radius: 3px; clip: true;
+            height: 6px; background: Theme.track; border-radius: Metrics.radius-xs; clip: true;
             Rectangle {
-                height: 100%; border-radius: 3px;
+                height: 100%; border-radius: Metrics.radius-xs;
                 width: parent.width * root.pw-bar-width; background: root.pw-bar-color;
                 animate width { duration: 250ms; easing: ease-in-out; }
                 animate background { duration: 250ms; easing: ease-in-out; }
             }
         }
 
-        Text { text: root.password-text != "" ? root.password-strength-text : ""; font-size: 12px; color: #d7d7d7; }
+        Text { text: root.password-text != "" ? root.password-strength-text : ""; font-size: Type.secondary; color: Theme.text-hint; }
         LineEdit { input-type: InputType.password; placeholder-text: "Confirm Password"; text <=> confirm-password-text; }
-        Text { text: root.passwords-mismatch ? "Passwords do not match" : ""; color: #ff5555; font-size: 12px; }
-        Text { text: status-message; color: #ff5555; wrap: TextWrap.word-wrap; }
+        Text { text: root.passwords-mismatch ? "Passwords do not match" : ""; color: Theme.danger; font-size: Type.secondary; }
+        Text { text: status-message; color: Theme.danger; wrap: TextWrap.word-wrap; }
 
         HorizontalBox {
-            spacing: 10px;
+            spacing: Metrics.gap-l;
             Button { text: "Back"; horizontal-stretch: 1; clicked => { root.current-screen = 0; } }
             Button {
                 text: "Register";
@@ -341,13 +569,13 @@ export component MainWindow inherits Window {
     // so there is nothing to click through to. No Back button: there is
     // nothing to go back to, the session is already open.
     VerticalBox {
-        padding: 20px;
-        spacing: 15px;
+        padding: Metrics.pad-xxl;
+        spacing: Metrics.gap-xl;
         visible: root.current-screen == 5;
 
         Text {
             text: "Password change required";
-            font-size: 24px;
+            font-size: Type.display;
             font-weight: 700;
             horizontal-alignment: center;
         }
@@ -355,8 +583,8 @@ export component MainWindow inherits Window {
         Text {
             text: "Your password was reset by an administrator. Enter the temporary password you were given and choose a new one. All other devices will be signed out.";
             wrap: TextWrap.word-wrap;
-            color: #d7d7d7;
-            font-size: 13px;
+            color: Theme.text-hint;
+            font-size: Type.secondary;
         }
 
         LineEdit {
@@ -373,19 +601,19 @@ export component MainWindow inherits Window {
         }
 
         Rectangle {
-            height: 6px; background: #2d2d2d; border-radius: 3px; clip: true;
+            height: 6px; background: Theme.track; border-radius: Metrics.radius-xs; clip: true;
             Rectangle {
-                height: 100%; border-radius: 3px;
+                height: 100%; border-radius: Metrics.radius-xs;
                 width: parent.width * root.pw-bar-width; background: root.pw-bar-color;
                 animate width { duration: 250ms; easing: ease-in-out; }
                 animate background { duration: 250ms; easing: ease-in-out; }
             }
         }
 
-        Text { text: root.password-text != "" ? root.password-strength-text : ""; font-size: 12px; color: #d7d7d7; }
+        Text { text: root.password-text != "" ? root.password-strength-text : ""; font-size: Type.secondary; color: Theme.text-hint; }
         LineEdit { input-type: InputType.password; placeholder-text: "Confirm new password"; text <=> root.confirm-password-text; }
-        Text { text: root.passwords-mismatch ? "Passwords do not match" : ""; color: #ff5555; font-size: 12px; }
-        Text { text: status-message; color: #ff5555; wrap: TextWrap.word-wrap; }
+        Text { text: root.passwords-mismatch ? "Passwords do not match" : ""; color: Theme.danger; font-size: Type.secondary; }
+        Text { text: status-message; color: Theme.danger; wrap: TextWrap.word-wrap; }
 
         Button {
             text: "Change password";
@@ -396,18 +624,18 @@ export component MainWindow inherits Window {
 
     // --- ЭКРАН НАСТРОЕК (2) ---
     VerticalBox {
-        padding: 20px;
-        spacing: 15px;
+        padding: Metrics.pad-xxl;
+        spacing: Metrics.gap-xl;
         visible: root.current-screen == 2;
 
-        Text { text: "Server Settings"; font-size: 24px; font-weight: 700; horizontal-alignment: center; }
+        Text { text: "Server Settings"; font-size: Type.display; font-weight: 700; horizontal-alignment: center; }
         HorizontalBox {
-            spacing: 10px;
+            spacing: Metrics.gap-l;
             Text { text: "Address:"; vertical-alignment: center; min-width: 80px; }
             LineEdit { placeholder-text: "my.domain.com:6969"; text <=> server-address; horizontal-stretch: 1; }
         }
         HorizontalBox {
-            spacing: 10px;
+            spacing: Metrics.gap-l;
             Button { text: "Back"; horizontal-stretch: 1; clicked => { root.current-screen = 0; } }
             Button { text: "Save"; horizontal-stretch: 1; clicked => { root.save-settings(server-address); root.current-screen = 0; } }
         }
@@ -415,15 +643,15 @@ export component MainWindow inherits Window {
 
     // --- ЭКРАН ПОИСКА (3) ---
     VerticalBox {
-        padding: 20px;
-        spacing: 15px;
+        padding: Metrics.pad-xxl;
+        spacing: Metrics.gap-xl;
         visible: root.current-screen == 3;
 
-        Text { text: "Add Friend"; font-size: 24px; font-weight: 700; horizontal-alignment: center; }
+        Text { text: "Add Friend"; font-size: Type.display; font-weight: 700; horizontal-alignment: center; }
         LineEdit { placeholder-text: "Enter user login..."; text <=> search-text; }
         Button { text: "Search"; clicked => { root.search-user(search-text); } }
 
-        Text { text: search-result; color: #ff5555; wrap: TextWrap.word-wrap; }
+        Text { text: search-result; color: Theme.danger; wrap: TextWrap.word-wrap; }
 
         Button { text: "Back"; clicked => { root.current-screen = 1; } }
     }
@@ -437,43 +665,43 @@ export component MainWindow inherits Window {
         // ЛЕВАЯ ПАНЕЛЬ (Список друзей)
         Rectangle {
             width: 250px;
-            background: #1a1a24;
+            background: Theme.window-bg;
 
             VerticalBox {
-                padding: 10px;
-                spacing: 10px;
+                padding: Metrics.pad-l;
+                spacing: Metrics.gap-l;
 
-                Text { text: "Chats"; font-size: 20px; font-weight: 700; }
+                Text { text: "Chats"; font-size: Type.title; font-weight: 700; }
 
                 ListView {
                     vertical-stretch: 1;
-                    for entry in root.friends-list : FriendItem {
+                    for entry in root.conversations-list : ConvItem {
                         entry: entry;
-                        clicked => { root.open-chat(entry.user-id, entry.login); }
+                        clicked => { root.open-conversation(entry.conv-id); }
                     }
                 }
 
-                Button { text: "🔍 Search User"; clicked => { root.current-screen = 3; } }
+                Button { text: "Contacts"; clicked => { root.show-contacts(); } }
                 Button { text: "Disconnect"; clicked => { root.disconnect(); } }
                 Button { text: "Log out"; clicked => { root.logout(); } }
 
                 HorizontalBox {
-                    spacing: 6px;
+                    spacing: Metrics.gap;
                     alignment: start;
 
-                    if root.link-state == 3 : Text {
-                        text: "✓";
-                        color: #55aa55;
-                        font-size: 13px;
-                        vertical-alignment: center;
+                    if root.link-state == 3 : Image {
+                        source: @image-url("icons/disc.svg");
+                        width: 8px;
+                        height: 8px;
+                        colorize: Theme.online;
                     }
 
                     if root.link-state == 1 || root.link-state == 2 : Spinner { }
 
                     Text {
                         text: root.link-state == 3 ? "Online" : root.link-state == 2 ? "No connection" : root.link-state == 1 ? "Connecting..." : "Offline";
-                        color: #9aa0a6;
-                        font-size: 11px;
+                        color: Theme.text-sub;
+                        font-size: Type.caption;
                         vertical-alignment: center;
                     }
 
@@ -488,24 +716,46 @@ export component MainWindow inherits Window {
         // ПРАВАЯ ПАНЕЛЬ (Окно чата)
         Rectangle {
             horizontal-stretch: 1;
-            background: #111118;
+            background: Theme.chat-bg;
 
             VerticalBox {
-                padding: 10px;
-                spacing: 10px;
+                padding: Metrics.pad-l;
+                spacing: Metrics.gap-l;
 
-                if root.active-peer-id == -1 : Text {
+                if !root.dialog-open : Text {
                     text: "Select a chat to start messaging";
                     horizontal-alignment: center;
                     vertical-alignment: center;
                     vertical-stretch: 1;
                 }
 
-                if root.active-peer-id != -1 : VerticalBox {
+                if root.dialog-open : VerticalBox {
                     vertical-stretch: 1;
-                    spacing: 10px;
+                    spacing: Metrics.gap-l;
 
-                    Text { text: root.active-peer-login; font-size: 18px; font-weight: 700; }
+                    HorizontalBox {
+                        spacing: Metrics.gap-l;
+
+                        Text {
+                            text: root.active-title;
+                            font-size: Type.title;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+
+                        if root.active-is-group : Text {
+                            text: root.active-members-label;
+                            color: Theme.text-sub;
+                            font-size: Type.secondary;
+                            vertical-alignment: center;
+                        }
+
+                        if root.active-is-group : Button {
+                            text: "Members";
+                            clicked => { root.open-group-panel(); }
+                        }
+                    }
 
                     Rectangle {
                         vertical-stretch: 1;
@@ -549,7 +799,7 @@ export component MainWindow inherits Window {
                                 }
                                 for msg in root.active-chat-messages : HorizontalBox {
                                     spacing: 0px;
-                                    padding: 5px;
+                                    padding: Metrics.pad-s;
 
                                     if msg.is-outgoing : Rectangle {
                                         horizontal-stretch: 1;
@@ -575,20 +825,35 @@ export component MainWindow inherits Window {
                             y: parent.height - self.height - 12px;
                             x: parent.width - self.width - 12px;
                             height: 28px;
-                            width: pill-text.preferred-width + 24px;
-                            border-radius: 14px;
-                            background: #2b6cb0;
+                            width: pill-text.preferred-width + 36px;
+                            background: transparent;
+
+                            Image {
+                                source: @image-url("icons/disc.svg");
+                                width: 100%;
+                                height: 100%;
+                                colorize: Theme.accent;
+                            }
 
                             pill-text := Text {
-                                x: 12px;
+                                x: 24px;
                                 y: 0px;
-                                width: parent.width - 24px;
+                                width: parent.width - 36px;
                                 height: parent.height;
-                                text: "↓ " + root.missed-count;
-                                color: #ffffff;
-                                font-size: 12px;
+                                text: root.missed-count;
+                                color: Theme.on-accent;
+                                font-size: Type.secondary;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
+                            }
+
+                            Image {
+                                source: @image-url("icons/arrow-down.svg");
+                                x: 10px;
+                                y: (parent.height - self.height) / 2;
+                                width: 12px;
+                                height: 12px;
+                                colorize: Theme.on-accent;
                             }
 
                             TouchArea {
@@ -602,7 +867,7 @@ export component MainWindow inherits Window {
                     }
 
                     HorizontalBox {
-                        spacing: 10px;
+                        spacing: Metrics.gap-l;
                         LineEdit {
                             placeholder-text: "Type message...";
                             text <=> input-text;
@@ -618,6 +883,261 @@ export component MainWindow inherits Window {
         }
     }
 
+    // --- ЭКРАН КОНТАКТОВ (6) ---
+    VerticalBox {
+        padding: Metrics.pad-xxl;
+        spacing: Metrics.gap-l;
+        visible: root.current-screen == 6;
+
+        if !root.contacts-create-mode : VerticalBox {
+            spacing: Metrics.gap-l;
+            vertical-stretch: 1;
+
+            Text { text: "Contacts"; font-size: Type.display; font-weight: 700; horizontal-alignment: center; }
+
+            HorizontalBox {
+                spacing: Metrics.gap-l;
+                LineEdit {
+                    placeholder-text: "Find by login...";
+                    text <=> root.search-text;
+                    horizontal-stretch: 1;
+                    accepted => { root.search-user(root.search-text); }
+                }
+                Button { text: "Find"; clicked => { root.search-user(root.search-text); } }
+            }
+            Text { text: root.search-result; color: Theme.danger; wrap: TextWrap.word-wrap; font-size: Type.secondary; }
+
+            Text { text: "Friends"; font-size: Type.section; font-weight: 700; }
+            ListView {
+                vertical-stretch: 1;
+                for f in root.contacts-friends : Rectangle {
+                    height: 40px;
+                    background: ta.has-hover ? Theme.hover-bg : Theme.window-bg;
+
+                    HorizontalLayout {
+                        padding: Metrics.pad;
+                        spacing: Metrics.gap;
+                        Text {
+                            text: f.login;
+                            font-size: Type.row;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        VerticalLayout {
+                            alignment: LayoutAlignment.center;
+                            Button { text: "Chat"; clicked => { root.open-friend-chat(f.user-id); } }
+                        }
+                    }
+
+                    ta := TouchArea {
+                        clicked => { root.open-friend-chat(f.user-id); }
+                    }
+                }
+            }
+
+            if root.contacts-requests.length > 0 : Text { text: "Requests"; font-size: Type.section; font-weight: 700; }
+            if root.contacts-requests.length > 0 : ListView {
+                height: 120px;
+                for r in root.contacts-requests : HorizontalLayout {
+                    padding: Metrics.pad;
+                    spacing: Metrics.gap;
+                    Text { text: r.login; font-size: Type.row; vertical-alignment: center; horizontal-stretch: 1; }
+                    Button { text: "Accept"; clicked => { root.accept-request(r.user-id); } }
+                }
+            }
+
+            HorizontalBox {
+                spacing: Metrics.gap-l;
+                Button { text: "New group"; horizontal-stretch: 1; clicked => { root.contacts-create-mode = true; } }
+                Button { text: "Back"; horizontal-stretch: 1; clicked => { root.contacts-back(); } }
+            }
+        }
+
+        if root.contacts-create-mode : VerticalBox {
+            spacing: Metrics.gap-l;
+            vertical-stretch: 1;
+
+            Text { text: "New group"; font-size: Type.title; font-weight: 700; }
+            LineEdit { placeholder-text: "Group name"; text <=> root.group-name-text; }
+
+            Text { text: "Pick members from your friends"; font-size: Type.secondary; color: Theme.text-sub; }
+            ListView {
+                vertical-stretch: 1;
+                for f in root.contacts-friends : HorizontalLayout {
+                    padding: Metrics.pad;
+                    spacing: Metrics.gap;
+                    CheckBox {
+                        text: f.login;
+                        checked: f.selected;
+                        toggled => { root.toggle-friend(f.user-id); }
+                    }
+                }
+            }
+
+            HorizontalBox {
+                spacing: Metrics.gap-l;
+                Button { text: "Cancel"; horizontal-stretch: 1; clicked => { root.contacts-create-mode = false; root.group-name-text = ""; } }
+                Button {
+                    text: "Create";
+                    horizontal-stretch: 1;
+                    clicked => { root.create-group(root.group-name-text); }
+                }
+            }
+        }
+    }
+
+    // --- ЭКРАН ГРУППЫ (7) ---
+    Rectangle {
+        visible: root.current-screen == 7;
+
+        if !root.group-you-left : VerticalBox {
+            padding: Metrics.pad-xxl;
+            spacing: Metrics.gap-l;
+
+            Text { text: "Group"; font-size: Type.title; font-weight: 700; }
+
+            if root.group-perm-change-info : HorizontalBox {
+                spacing: Metrics.gap-l;
+                LineEdit {
+                    placeholder-text: "New name";
+                    text <=> root.group-rename-text;
+                    horizontal-stretch: 1;
+                }
+                Button {
+                    text: "Rename";
+                    clicked => { if root.group-rename-text != "" { root.group-rename(root.group-rename-text); root.group-rename-text = ""; } }
+                }
+            }
+
+            ListView {
+                vertical-stretch: 1;
+                for m in root.group-members : MemberItem {
+                    entry: m;
+                    selected: m.user-id == root.group-selected-member;
+                    clicked => { root.group-select-member(m.user-id); }
+                    remove-clicked => { root.group-remove-member(m.user-id); }
+                }
+            }
+
+            if root.group-editor-visible : VerticalBox {
+                spacing: Metrics.gap;
+                Text { text: "Admin rights of the selected member"; font-size: Type.secondary; color: Theme.text-sub; }
+                CheckBox { text: "Change info"; checked <=> root.edit-change-info; }
+                CheckBox { text: "Invite users"; checked <=> root.edit-invite-users; }
+                CheckBox { text: "Ban users"; checked <=> root.edit-ban-users; }
+                CheckBox { text: "Add admins"; checked <=> root.edit-add-admins; }
+                Button {
+                    text: "Apply rights";
+                    clicked => {
+                        root.group-apply-rights(root.group-selected-member,
+                            root.edit-change-info, root.edit-invite-users,
+                            root.edit-ban-users, root.edit-add-admins);
+                    }
+                }
+            }
+
+            if root.group-perm-invite : HorizontalBox {
+                spacing: Metrics.gap-l;
+                ComboBox {
+                    model: root.group-addable;
+                    horizontal-stretch: 1;
+                    selected(value) => { root.group-add-name = value; }
+                }
+                Button {
+                    text: "Add";
+                    enabled: root.group-add-name != "";
+                    clicked => { root.group-add-member(root.group-add-name); }
+                }
+            }
+
+            HorizontalBox {
+                spacing: Metrics.gap-l;
+                Button {
+                    text: "Leave group";
+                    horizontal-stretch: 1;
+                    clicked => {
+                        if root.group-im-owner { root.show-leave-confirm = true; }
+                        else { root.group-leave(false); }
+                    }
+                }
+                if root.group-im-owner : Button {
+                    text: "Delete group";
+                    horizontal-stretch: 1;
+                    clicked => { root.group-delete(); }
+                }
+            }
+
+            Button { text: "Back"; clicked => { root.group-back(); } }
+        }
+
+        if root.group-you-left : VerticalBox {
+            padding: Metrics.pad-xxl;
+            spacing: Metrics.gap-l;
+
+            Text { text: "Your group"; font-size: Type.title; font-weight: 700; }
+            Text {
+                text: "You still own this group but are not a member: no messages reach you here. Come back, or delete the group for everyone.";
+                wrap: TextWrap.word-wrap;
+                color: Theme.text-hint;
+                font-size: Type.secondary;
+            }
+            Button { text: "Join back"; clicked => { root.group-join(); } }
+            Button { text: "Delete group"; clicked => { root.group-delete(); } }
+            Button { text: "Back"; clicked => { root.group-back(); } }
+        }
+
+        // The owner's leave is two questions, not one: who the group goes
+        // to decides whether there is a way back.
+        if root.show-leave-confirm : Rectangle {
+            background: Theme.scrim;
+
+            TouchArea { }
+
+            // The software renderer cannot blur, but resvg can: the
+            // dialog's shadow is baked into an SVG and laid 1:1 behind
+            // the box, the downward nudge already inside the asset.
+            // The 420x260 is the 380x220 dialog plus its 20px halo.
+            Image {
+                source: @image-url("icons/shadow-modal.svg");
+                width: 420px;
+                height: 260px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 380px;
+                height: 220px;
+                background: Theme.window-bg;
+                border-radius: Metrics.radius-l;
+
+                VerticalBox {
+                    padding: Metrics.pad-xl;
+                    spacing: Metrics.gap-l;
+
+                    Text { text: "Leave group?"; font-size: Type.title; font-weight: 700; horizontal-alignment: center; }
+                    Text {
+                        text: "Transfer ownership to the first admin, or keep it and come back later?";
+                        wrap: TextWrap.word-wrap;
+                        color: Theme.text-hint;
+                        font-size: Type.secondary;
+                    }
+                    Button {
+                        text: "Transfer to the first admin";
+                        clicked => { root.show-leave-confirm = false; root.group-leave(true); }
+                    }
+                    Button {
+                        text: "Keep ownership, just leave";
+                        clicked => { root.show-leave-confirm = false; root.group-leave(false); }
+                    }
+                    Button { text: "Cancel"; clicked => { root.show-leave-confirm = false; } }
+                }
+            }
+        }
+    }
+
     callback connect(string, string, string, bool, string);
     callback disconnect();
     callback logout();
@@ -626,7 +1146,27 @@ export component MainWindow inherits Window {
 callback change-password(string, string);
     callback search-user(string);
     callback open-chat(int, string);
+    // Screen 1: a row of the conversation list.
+    callback open-conversation(string);
     callback send-msg(string);
+    // Screen 6: contacts.
+    callback show-contacts();
+    callback contacts-back();
+    callback open-friend-chat(int);
+    callback accept-request(int);
+    callback toggle-friend(int);
+    callback create-group(string);
+    // Screen 7: the group panel.
+    callback open-group-panel();
+    callback group-back();
+    callback group-rename(string);
+    callback group-add-member(string);
+    callback group-remove-member(int);
+    callback group-select-member(int);
+    callback group-apply-rights(int, bool, bool, bool, bool);
+    callback group-leave(bool);
+    callback group-delete();
+    callback group-join();
     // Asked by the corner when the reader will not wait out the timer.
     callback reconnect();
     // Bumped whenever the reader is to be taken to the newest message:

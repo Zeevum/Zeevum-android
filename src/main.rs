@@ -14,11 +14,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = MainWindow::new()?;
 
     if let Some(profile) = settings::profile_label() {
-        app.set_window_title(format!("Rusty Chat [{profile}]").into());
+        app.set_window_title(format!("Zeevum [{profile}]").into());
     }
 
-    app.set_friends_list(ModelRc::from(Rc::new(VecModel::default())));
     app.set_active_chat_messages(ModelRc::from(Rc::new(VecModel::default())));
+    app.set_conversations_list(ModelRc::from(Rc::new(VecModel::default())));
+    app.set_contacts_friends(ModelRc::from(Rc::new(VecModel::default())));
+    app.set_contacts_requests(ModelRc::from(Rc::new(VecModel::default())));
+    app.set_group_members(ModelRc::from(Rc::new(VecModel::default())));
+    app.set_group_addable(ModelRc::from(Rc::new(VecModel::default())));
 
     let controller = controller::AppController::new(app.as_weak());
 
@@ -95,6 +99,125 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let controller = controller.clone();
         app.on_reconnect(move || {
             controller.handle_reconnect_now();
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_open_conversation(move |conv_id| {
+            controller.handle_open_conversation(conv_id);
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_show_contacts(move || {
+            controller.handle_show_contacts();
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_contacts_back(move || {
+            controller.handle_contacts_back();
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_open_friend_chat(move |user_id| {
+            controller.handle_open_friend_chat(user_id);
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_accept_request(move |user_id| {
+            controller.handle_accept_request(user_id);
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_toggle_friend(move |user_id| {
+            controller.handle_toggle_friend(user_id);
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_create_group(move |title| {
+            controller.handle_create_group(title);
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_open_group_panel(move || {
+            controller.handle_open_group_panel();
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_group_back(move || {
+            controller.handle_group_back();
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_group_rename(move |title| {
+            controller.handle_group_rename(title);
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_group_add_member(move |login| {
+            controller.handle_group_add_member(login);
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_group_remove_member(move |user_id| {
+            controller.handle_group_remove_member(user_id);
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_group_select_member(move |user_id| {
+            controller.handle_group_select_member(user_id);
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_group_apply_rights(move |user_id, ci, inv, ban, adm| {
+            controller.handle_group_apply_rights(user_id, ci, inv, ban, adm);
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_group_leave(move |transfer| {
+            controller.handle_group_leave(transfer);
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_group_delete(move || {
+            controller.handle_group_delete();
+        });
+    }
+
+    {
+        let controller = controller.clone();
+        app.on_group_join(move || {
+            controller.handle_group_join();
         });
     }
 
